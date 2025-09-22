@@ -106,6 +106,18 @@ Two baseline methods are provided in `baselines` folder.
 - raw2hsi.py provides a CNN+PixelShuffle approach to reconstruct 61 bands HSI cube from Raw Mosaic data, i.e., mosaic -> hsi_61
 - mstpp_up provides a modified mstpp approach to jointly reconstruct the spectral and spatial resolution of HSI cube from a low resolution RGB. 
 
+Additional CPU-friendly baselines added:
+- baselines/linear_mapper.py: Linear Tile Mapper (1x1 conv in packed space + PixelShuffle).
+- baselines/pca_mapper.py: PCA-coefficient mapper with fixed spectral basis (compute via `tools/compute_pca_basis_track1.py`).
+
+Training:
+- Track 1 linear: `python track1_train.py` (uses LinearRaw2HSI by default).
+- Track 1 PCA: `python tools/compute_pca_basis_track1.py --data_dir data/track1 --k 12` then `python track1_train_pca.py --pca_basis runs/track1/pca/pca_basis_k12.npz`.
+
+Submission (CPU):
+- Simple: `python track1_submission.py --ckpt runs/track1/mosaic2hsi_baseline_v3/model_best.pt --model linear`
+- With TTA: `python track1_submission_tta.py --ckpt ... --model linear`
+
 To train the baseline models, you can run the `track1_train.py` for track 2 and `track1_train.py` for track 2.
 
 ## VRAM Requirements

@@ -11,3 +11,4 @@ torch
 torchinfo
 torchmetrics
 torchvision
+tqdm

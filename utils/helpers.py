@@ -95,3 +95,14 @@ def _deltaE00_mean(rgb1: np.ndarray, rgb2: np.ndarray) -> float:
     Lab2 = colour.XYZ_to_Lab(XYZ2)
     dE = colour.difference.delta_E(Lab1.reshape(-1, 3), Lab2.reshape(-1, 3), method="CIE 2000")
     return float(np.mean(dE))
+
+
+def spectral_total_variation(pred_hsi: torch.Tensor, weight: float = 1.0) -> torch.Tensor:
+    """
+    1D TV along spectral dimension for CHW tensors (batch supported). Encourages smooth spectra.
+    pred_hsi: (N,C,H,W) in [0,1]
+    """
+    if pred_hsi.ndim != 4:
+        raise ValueError("pred_hsi must be NCHW")
+    diff = pred_hsi[:, 1:, :, :] - pred_hsi[:, :-1, :, :]
+    return weight * torch.mean(torch.abs(diff))
