@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 @dataclass
 class TrainerCfg:
     out_dir: str = "runs/track1/mosaic2hsi_baseline_v3"
-    epochs: int = 60
+    epochs: int = 10
     amp: bool = True
     save_best: bool = True
     psnr_range: Tuple[float, float] = (20.0, 50.0)  # for reporting scale only
