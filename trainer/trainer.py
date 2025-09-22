@@ -51,7 +51,7 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler() if (self.cfg.amp and self.device.type == "cuda") else None
         self.loss_fn = loss_fn if loss_fn is not None else ReconLoss(lambda_sam=0.1)
         
-        self.wl_nm = cfg.wl_61  # wavelength vector for rendering
+        self.wl_nm = self.cfg.wl_61  # wavelength vector for rendering
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         if self.cfg.scheduler_type == "cosine":
@@ -77,8 +77,40 @@ class Trainer:
                 ]
                 w.writerow(header)
 
+        # Timing CSVs
+        self.train_timing_csv = self.out_dir / "train_timing.csv"
+        if not self.train_timing_csv.exists():
+            with open(self.train_timing_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "epoch", "step", "steps_total", "batch_size",
+                    "to_device_ms", "forward_ms", "loss_ms", "backward_ms", "optim_ms",
+                    "iter_ms", "samples_per_s",
+                ])
+        self.val_timing_csv = self.out_dir / "val_timing.csv"
+        if not self.val_timing_csv.exists():
+            with open(self.val_timing_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "epoch", "step", "steps_total", "batch_size",
+                    "to_device_ms", "forward_ms", "metrics_ms", "iter_ms",
+                ])
+
         self.best_val = float("inf")
 
+
+    def _sync_cuda(self) -> None:
+        if isinstance(self.device, torch.device) and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _now(self) -> float:
+        # High-res timer with CUDA sync for accurate GPU timings
+        self._sync_cuda()
+        return time.perf_counter()
+
+    def _append_csv(self, path: Path, row: List[Any]) -> None:
+        with open(path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
 
     def _forward_loss(self, input_img: torch.Tensor, output_cube: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.scaler is None:
@@ -97,30 +129,82 @@ class Trainer:
         n_samples = 0
         t0 = time.time()
 
-        for batch in self.train_loader:
+        steps_total = len(self.train_loader)
+        print(f"[Train] Epoch {epoch} | steps: {steps_total}")
+        sum_to_dev = sum_fwd = sum_loss = sum_bwd = sum_opt = sum_iter = 0.0
+
+        for step_idx, batch in enumerate(self.train_loader, start=1):
+            iter_start = self._now()
+
+            # To device timing
+            t = self._now()
             input_img  :   torch.Tensor = batch["input"].to(self.device, non_blocking=True)     # (N,c(1 or 3),H,W)
             output_cube:   torch.Tensor = batch["output"].to(self.device, non_blocking=True)    # (N,C,H,W)
+            to_device_ms = (self._now() - t) * 1000.0
 
+            bs = int(input_img.size(0))
+
+            # Zero grad
             self.optimizer.zero_grad(set_to_none=True)
+
+            # Forward + loss timing
+            t = self._now()
+            pred, loss = self._forward_loss(input_img, output_cube)
+            forward_ms = (self._now() - t) * 1000.0
+
+            # Explicit loss read (negligible, but measured)
+            t = self._now()
+            loss_value = float(loss.item())
+            loss_ms = (self._now() - t) * 1000.0
+
+            # Backward + optimizer timing
             if self.scaler is None:
-                pred, loss = self._forward_loss(input_img, output_cube)
-                loss.backward()
-                self.optimizer.step()
+                t = self._now(); loss.backward(); backward_ms = (self._now() - t) * 1000.0
+                t = self._now(); self.optimizer.step(); optim_ms = (self._now() - t) * 1000.0
             else:
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-                    pred, loss = self._forward_loss(input_img, output_cube)
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                    pass  # already forward in autocast within _forward_loss
+                t = self._now(); self.scaler.scale(loss).backward(); backward_ms = (self._now() - t) * 1000.0
+                t = self._now(); self.scaler.step(self.optimizer); self.scaler.update(); optim_ms = (self._now() - t) * 1000.0
 
-            running += float(loss.item()) * input_img.size(0)
-            n_samples += input_img.size(0)
+            iter_ms = (self._now() - iter_start) * 1000.0
+            samples_per_s = (bs / (iter_ms / 1000.0)) if iter_ms > 0 else float("inf")
+
+            running += loss_value * bs
+            n_samples += bs
+
+            # Accumulate for epoch averages
+            sum_to_dev += to_device_ms; sum_fwd += forward_ms; sum_loss += loss_ms
+            sum_bwd += backward_ms; sum_opt += optim_ms; sum_iter += iter_ms
+
+            # CSV timing log per step
+            self._append_csv(self.train_timing_csv, [
+                epoch, step_idx, steps_total, bs,
+                f"{to_device_ms:.3f}", f"{forward_ms:.3f}", f"{loss_ms:.3f}", f"{backward_ms:.3f}", f"{optim_ms:.3f}",
+                f"{iter_ms:.3f}", f"{samples_per_s:.2f}",
+            ])
+
+            # Console print each step
+            print(
+                f"[Train] ep {epoch} step {step_idx}/{steps_total} | "
+                f"to_dev {to_device_ms:.2f}ms  fwd {forward_ms:.2f}ms  "
+                f"bwd {backward_ms:.2f}ms  opt {optim_ms:.2f}ms  "
+                f"iter {iter_ms:.2f}ms  ips {samples_per_s:.1f}"
+            )
 
         if self.scheduler is not None:
-            self.scheduler.step()
+            t_sched = self._now(); self.scheduler.step(); sched_ms = (self._now() - t_sched) * 1000.0
+            print(f"[Train] Epoch {epoch} scheduler.step() took {sched_ms:.2f} ms")
 
         avg = running / max(n_samples, 1)
         dt = time.time() - t0
+        # Epoch-level averages
+        if steps_total > 0:
+            print(
+                f"[Train] Epoch {epoch} done in {dt:.2f}s | "
+                f"avg to_dev {sum_to_dev/steps_total:.2f}ms, fwd {sum_fwd/steps_total:.2f}ms, "
+                f"bwd {sum_bwd/steps_total:.2f}ms, opt {sum_opt/steps_total:.2f}ms, iter {sum_iter/steps_total:.2f}ms"
+            )
         return avg
 
     @torch.no_grad()
@@ -133,43 +217,79 @@ class Trainer:
         loss_sum = 0.0
         n_samples = 0
 
+
         sam_list: List[float] = []
         sid_list: List[float] = []
         erg_list: List[float] = []
         psnr_list: List[float] = []
         ssim_list: List[float] = []
+        
+        steps_total = len(self.val_loader)
+        print(f"[Valid] Epoch {epoch} | steps: {steps_total}")
 
 
-        for batch in self.val_loader:
+        
+        for step_idx, batch in enumerate(self.val_loader, start=1):
+            iter_start = self._now()
+            t = self._now()
             input_img  :   torch.Tensor = batch["input"].to(self.device, non_blocking=True)
             output_cube:   torch.Tensor = batch["output"].to(self.device, non_blocking=True)
+            to_device_ms = (self._now() - t) * 1000.0
 
             # forward (no grad)
+            t = self._now()
             pred_cube = self.model(input_img).clamp(0, 1)
             loss = self.loss_fn(pred_cube, output_cube)
+            forward_ms = (self._now() - t) * 1000.0
 
             loss_sum += float(loss.item()) * input_img.size(0)
             n_samples += input_img.size(0)
 
             # per-sample metrics
+            t = self._now()
+
             for i in range(pred_cube.size(0)):
-                # --- spectral metrics (means over mask) ---
-                sam_mean = sam(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy(), reduction="mean", mask=mask)      # deg (↓)
-                sid_mean = sid(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy(), reduction="mean", mask=mask)      # (↓)
-                erg_val  = ergas(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy(), scale=1.0)                      # (↓)
+                # Optional mask support
+                mask_np = None
+                if "mask" in batch and batch["mask"] is not None:
+                    m = batch["mask"][i].detach().cpu().numpy()
+                    mask_np = m.squeeze() if m.ndim == 3 else m
 
-                psnr_val = psnr(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy(), data_range=1.0, mask=mask)
-                ssim_val = ssim(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy(), data_range=1.0, mask=mask)
+                ref_np = output_cube[i].detach().cpu().numpy()
+                est_np = pred_cube[i].detach().cpu().numpy()
 
-                dE_mean  = _deltaE00_mean(output_cube[i].detach().cpu().numpy(), pred_cube[i].detach().cpu().numpy())
+                sam_val = sam(ref_np, est_np, reduction="mean", mask=mask_np)
 
+                sid_val = sid(ref_np, est_np, reduction="mean", mask=mask_np)
 
-                sam_list.append(scores["SAM_deg"])
-                sid_list.append(scores["SID"])
-                erg_list.append(scores["ERGAS"])
-                psnr_list.append(scores["PSNR_dB"])
-                ssim_list.append(scores["SSIM"])
+                erg_val = ergas(ref_np, est_np, scale=1.0)
 
+                psnr_val = psnr(ref_np, est_np, data_range=1.0, mask=mask_np)
+
+                # ssim_val = ssim(ref_np, est_np, data_range=1.0, mask=mask_np)
+                ssim_val = 0.0
+
+                sam_list.append(sam_val)
+                sid_list.append(sid_val)
+                erg_list.append(erg_val)
+                psnr_list.append(psnr_val)
+                ssim_list.append(ssim_val)
+
+            metrics_ms = (self._now() - t) * 1000.0
+
+            iter_ms = (self._now() - iter_start) * 1000.0
+
+            # CSV timing log per step
+            self._append_csv(self.val_timing_csv, [
+                epoch, step_idx, steps_total, int(input_img.size(0)),
+                f"{to_device_ms:.3f}", f"{forward_ms:.3f}", f"{metrics_ms:.3f}", f"{iter_ms:.3f}",
+            ])
+
+            # Console print each step
+            print(
+                f"[Valid] ep {epoch} step {step_idx}/{steps_total} | "
+                f"to_dev {to_device_ms:.2f}ms  fwd {forward_ms:.2f}ms  metrics {metrics_ms:.2f}ms  iter {iter_ms:.2f}ms"
+            )
 
         out: Dict[str, float] = {}
         out["val_loss"] = loss_sum / max(n_samples, 1)

@@ -34,6 +34,7 @@ class HyperObjectDataset(HSIDataset):
     ) -> None:
         super().__init__(root=data_root, transforms=transforms)
         self.track = track 
+        self.submisison = submisison
 
         if submisison:
             hsi_61_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test_original'}/hsi_61"), exts=(".h5",))
@@ -41,12 +42,19 @@ class HyperObjectDataset(HSIDataset):
             hsi_61_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test-public'}/hsi_61"), exts=(".h5",))
 
         if track == 1:
-            mosaic_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test-public'}/mosaic"), exts=(".npy",))
-            (self.ids, self._maps) = build_index(
-                {
-                    "mosaic": mosaic_path,
-                    "hsi": hsi_61_path,
-                })
+            if submisison:
+                mosaic_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test_original'}/mosaic"), exts=(".npy",))
+                (self.ids, self._maps) = build_index(
+                    {
+                        "mosaic": mosaic_path,
+                    })
+            else:
+                mosaic_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test-public'}/mosaic"), exts=(".npy",))
+                (self.ids, self._maps) = build_index(
+                    {
+                        "mosaic": mosaic_path,
+                        "hsi": hsi_61_path,
+                    })
         elif track == 2:
             if submisison:
                 rgb_2_path=ModalitySpec(root=Path(f"{data_root}/{'train' if train else 'test_original'}/rgb_2"),    exts=(".png", ".jpg"))
@@ -63,9 +71,12 @@ class HyperObjectDataset(HSIDataset):
         return len(self.ids)
 
     def _load_(self, stem: str):
-        p_hsi = self._maps["hsi"][stem]
-        cube = read_h5_cube(p_hsi, 'cube')                          # (H,W,C)
-        cube_t = torch.from_numpy(np.transpose(cube, (2, 0, 1)))    # C,H,W
+        if not (self.submisison and self.track == 1):
+            p_hsi = self._maps["hsi"][stem]
+            cube = read_h5_cube(p_hsi, 'cube')                          # (H,W,C)
+            cube_t = torch.from_numpy(np.transpose(cube, (2, 0, 1)))    # C,H,W
+        else:
+            cube_t = torch.empty(0)
 
         if self.track == 1:
             p_mosaic = self._maps["mosaic"][stem]

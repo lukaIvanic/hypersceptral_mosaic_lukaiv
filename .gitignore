@@ -1,5 +1,7 @@
 data/*
 !data/.gitkeep
+.venv/*
+submission_files*
 
 datasets/hyper_object_all.py
 draft.ipynb

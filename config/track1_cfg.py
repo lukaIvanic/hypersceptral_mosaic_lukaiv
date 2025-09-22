@@ -20,6 +20,6 @@ class TrainerCfg:
     lambda_sam: float = 0.1  # SAM loss weight
 
     # model parameters
-    base_ch: int = 64
-    n_blocks: int = 8
+    base_ch: int = 4
+    n_blocks: int = 2
     out_bands: int = 61  # number of output spectral bands
