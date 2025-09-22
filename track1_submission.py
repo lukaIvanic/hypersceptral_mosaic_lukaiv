@@ -6,19 +6,31 @@ import numpy as np
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
+import os
 
 from datasets.hyper_object import HyperObjectDataset
 from baselines.raw2hsi import Raw2HSI
+from baselines.linear_mapper import LinearRaw2HSI
+from baselines.pca_mapper import PCABasis, PCACoeffMapper
 from config.track1_cfg import TrainerCfg
 
 def _now_sync_cpu() -> float:
     # CPU timer
     return time.perf_counter()
 
-def load_model(ckpt_path, device):
+def load_model(ckpt_path, device, model_type: str = "raw2hsi", pca_basis_path: str = None):
     print(f"[Load] Loading model from: {ckpt_path}")
     cfg = TrainerCfg()
-    model = Raw2HSI(base_ch=cfg.base_ch, n_blocks=cfg.n_blocks, out_bands=cfg.out_bands).to(device)
+    if model_type == "linear":
+        model = LinearRaw2HSI(out_bands=cfg.out_bands).to(device)
+    elif model_type == "pca":
+        if pca_basis_path is None:
+            raise ValueError("--pca_basis is required when --model pca")
+        data = np.load(pca_basis_path)
+        basis = PCABasis(mean=data["mean"], components=data["components"]).to_torch(device)
+        model = PCACoeffMapper(basis=basis, out_bands=cfg.out_bands).to(device)
+    else:
+        model = Raw2HSI(base_ch=cfg.base_ch, n_blocks=cfg.n_blocks, out_bands=cfg.out_bands).to(device)
     state = torch.load(ckpt_path, map_location=device)
     if isinstance(state, dict) and "model" in state:
         print("[Load] Detected Trainer checkpoint format. Using state['model'].")
@@ -46,7 +58,7 @@ def main(args):
     print(f"[Data] Test samples: {len(ds_test)}")
     loader = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=0)
 
-    model = load_model(args.ckpt, device)
+    model = load_model(args.ckpt, device, model_type=args.model, pca_basis_path=args.pca_basis)
 
     ids = []
     steps_total = len(loader)
@@ -116,5 +128,7 @@ if __name__ == "__main__":
     p.add_argument("--ckpt", type=str, required=True, help="Path to model_best.pt or model_last.pt")
     p.add_argument("--out_dir", type=str, default="submission_files_track1")
     p.add_argument("--zip_path", type=str, default="submission_track1.zip")
+    p.add_argument("--model", type=str, default="linear", choices=["linear", "raw2hsi", "pca"], help="Which model architecture to instantiate")
+    p.add_argument("--pca_basis", type=str, default=None, help="Path to PCA basis .npz (required for --model pca)")
     args = p.parse_args()
     main(args)
