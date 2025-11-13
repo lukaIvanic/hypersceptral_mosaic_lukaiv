@@ -1,0 +1,702 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import random
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+import math
+
+from .config import TrainConfig
+from .data import create_dataloaders
+from .losses import CompositeSpectralLoss, LossWeights
+from .metrics import aggregate
+from .models.builder import create_model
+from .utils.inference import run_model_with_resize
+from .utils.metrics.schema import (
+    ACCURACY_METRIC_UNITS,
+    SOURCE_TRAIN,
+    TRAINING_METRIC_UNITS,
+    resolution_label,
+    resolution_tag,
+    units_from_defaults,
+)
+from .utils.metrics.storage import (
+    load_metrics_history,
+    remove_epoch_record,
+    save_metrics_history,
+    utc_timestamp,
+)
+
+try:
+    import psutil  # type: ignore[import-error]
+except ImportError:  # pragma: no cover
+    psutil = None
+
+logger = logging.getLogger(__name__)
+_PROCESS = psutil.Process() if psutil is not None else None
+
+
+class WarmupCosineScheduler:
+    """
+    Lightweight cosine scheduler with optional linear warmup.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        base_lr: float,
+        total_epochs: int,
+        warmup_epochs: int,
+        warmup_start_factor: float,
+        eta_min: float,
+    ) -> None:
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.total_epochs = max(total_epochs, 1)
+        self.warmup_epochs = max(min(warmup_epochs, self.total_epochs - 1), 0)
+        self.warmup_start_factor = float(max(min(warmup_start_factor, 1.0), 1e-4))
+        self.eta_min = float(max(min(eta_min, base_lr), 0.0))
+        self._last_lr = base_lr
+
+    def _compute_warmup_lr(self, epoch_index: int) -> float:
+        if self.warmup_epochs <= 0:
+            return self.base_lr
+        if self.warmup_epochs == 1:
+            return self.base_lr
+        progress = epoch_index / max(self.warmup_epochs - 1, 1)
+        progress = float(max(min(progress, 1.0), 0.0))
+        factor = self.warmup_start_factor + (1.0 - self.warmup_start_factor) * progress
+        return self.base_lr * factor
+
+    def _compute_cosine_lr(self, epoch_index: int) -> float:
+        cosine_epochs = max(self.total_epochs - self.warmup_epochs, 1)
+        progress = (epoch_index - self.warmup_epochs) / cosine_epochs
+        progress = float(max(min(progress, 1.0), 0.0))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        if self.base_lr <= 0:
+            return self.eta_min
+        min_factor = self.eta_min / self.base_lr
+        factor = min_factor + (1.0 - min_factor) * cosine
+        return self.base_lr * factor
+
+    def step(self, epoch_index: int) -> float:
+        if epoch_index < self.warmup_epochs:
+            lr = self._compute_warmup_lr(epoch_index)
+        else:
+            lr = self._compute_cosine_lr(epoch_index)
+
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        self._last_lr = lr
+        return lr
+
+    def get_last_lr(self) -> float:
+        return self._last_lr
+
+
+def create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+) -> Optional[WarmupCosineScheduler]:
+    name = getattr(cfg, "lr_scheduler", "none").lower()
+    if name in {"none", "", "off"}:
+        return None
+    if name != "cosine":
+        raise ValueError(
+            f"Unknown scheduler '{cfg.lr_scheduler}'. Supported options: none, cosine."
+        )
+
+    base_lr = optimizer.param_groups[0]["lr"]
+    scheduler = WarmupCosineScheduler(
+        optimizer=optimizer,
+        base_lr=base_lr,
+        total_epochs=cfg.epochs,
+        warmup_epochs=cfg.scheduler_warmup_epochs,
+        warmup_start_factor=cfg.scheduler_warmup_start_factor,
+        eta_min=cfg.scheduler_min_lr,
+    )
+    logger.info(
+        "[Scheduler] cosine | warmup_epochs=%d | start_factor=%.3f | eta_min=%.2e",
+        scheduler.warmup_epochs,
+        cfg.scheduler_warmup_start_factor,
+        cfg.scheduler_min_lr,
+    )
+    return scheduler
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    loss_fn: nn.Module,
+    log_interval: int,
+    epoch: int,
+    inference_resize: int | None,
+) -> Dict[str, float]:
+    model.train()
+    running_loss = 0.0
+    num_samples = 0
+    steps_total = len(loader)
+    timings = {
+        "io": 0.0,
+        "preprocess": 0.0,
+        "forward": 0.0,
+        "backward": 0.0,
+        "interp": 0.0,
+        "ram_mb": 0.0,
+    }
+    prev_time = time.perf_counter()
+
+    for step, batch in enumerate(loader, start=1):
+        io_time = time.perf_counter() - prev_time
+        preprocess_start = time.perf_counter()
+        inputs = batch["input"].to(device)
+        targets = batch["target"].to(device)
+        preprocess_time = time.perf_counter() - preprocess_start
+        batch_size = inputs.size(0)
+
+        optimizer.zero_grad(set_to_none=True)
+        forward_start = time.perf_counter()
+        final_shape = tuple(int(dim) for dim in targets.shape[-2:])
+        preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
+        forward_time = time.perf_counter() - forward_start
+        interp_time = getattr(model, "last_interp_time", 0.0)
+
+        backward_start = time.perf_counter()
+        loss = loss_fn(preds, targets)
+        loss.backward()
+        optimizer.step()
+        backward_time = time.perf_counter() - backward_start
+
+        running_loss += loss.item() * batch_size
+        num_samples += batch_size
+
+        timings["io"] += io_time
+        timings["preprocess"] += preprocess_time
+        timings["forward"] += forward_time
+        timings["backward"] += backward_time
+        timings["interp"] += interp_time
+        if _PROCESS is not None:
+            ram_mb = _PROCESS.memory_info().rss / (1024 ** 2)
+            timings["ram_mb"] += ram_mb
+        else:
+            ram_mb = None
+
+        logger.debug(
+            "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
+            "backward=%.2f ms | interp=%.2f ms%s",
+            epoch,
+            step,
+            steps_total,
+            io_time * 1e3,
+            preprocess_time * 1e3,
+            forward_time * 1e3,
+            backward_time * 1e3,
+            interp_time * 1e3,
+            "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
+        )
+
+        if step % log_interval == 0:
+            avg_loss = running_loss / max(num_samples, 1)
+            logger.info(
+                "[Train] Epoch %d Step %d/%d | loss=%.4f",
+                epoch,
+                step,
+                steps_total,
+                avg_loss,
+            )
+
+        prev_time = time.perf_counter()
+
+    avg_times = {k: (v / max(steps_total, 1)) for k, v in timings.items()}
+    avg_times["loss"] = running_loss / max(num_samples, 1)
+    return avg_times
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_fn: nn.Module,
+    inference_resize: int | None,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    counts = 0
+    metrics_sum = {k: 0.0 for k in ("mae", "mse", "psnr", "sam", "ergas")}
+
+    for batch in loader:
+        inputs = batch["input"].to(device)
+        targets = batch["target"].to(device)
+        batch_size = inputs.size(0)
+
+        final_shape = tuple(int(dim) for dim in targets.shape[-2:])
+        preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
+        loss = loss_fn(preds, targets)
+
+        total_loss += loss.item() * batch_size
+        counts += batch_size
+
+        batch_metrics = aggregate(preds, targets, metrics=("mae", "mse", "psnr", "sam", "ergas"))
+        for key, value in batch_metrics.items():
+            metrics_sum[key] += value * batch_size
+
+    results = {k: v / max(counts, 1) for k, v in metrics_sum.items()}
+    results["loss"] = total_loss / max(counts, 1)
+    return results
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    path: Path,
+    model_variant: str | None = None,
+) -> None:
+    state = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "variant": model_variant or getattr(model, "variant_name", None),
+    }
+    torch.save(state, path)
+    logger.info("[Checkpoint] Saved to %s", path)
+
+
+def main(args: argparse.Namespace) -> None:
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    cfg = TrainConfig()
+
+    if args.data_root is not None:
+        cfg.data_root = Path(args.data_root)
+    if args.run_name is not None:
+        cfg.run_name = args.run_name
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.learning_rate is not None:
+        cfg.learning_rate = args.learning_rate
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    if args.prefetch_factor is not None:
+        cfg.prefetch_factor = args.prefetch_factor
+    if args.cache_dir is not None:
+        cfg.cache_dir = None if args.cache_dir.lower() in {"none", ""} else Path(args.cache_dir)
+    if args.no_cache:
+        cfg.cache_dir = None
+    if args.no_write_cache:
+        cfg.write_cache = False
+    if args.device is not None:
+        cfg.device = args.device
+    if args.hidden_channels is not None:
+        cfg.hidden_channels = args.hidden_channels
+    if args.log_interval is not None:
+        cfg.log_interval = args.log_interval
+    if args.resize_to is not None:
+        cfg.resize_to = args.resize_to if args.resize_to > 0 else None
+    if getattr(args, "train_inference_resize", None) is not None:
+        value = args.train_inference_resize
+        cfg.train_inference_resize = value if value and value > 0 else None
+    if getattr(args, "model_variant", None) is not None:
+        cfg.model_variant = args.model_variant.lower()
+    if getattr(args, "unet_base_channels", None) is not None:
+        cfg.unet_base_channels = args.unet_base_channels
+    if getattr(args, "latent_channels", None) is not None:
+        cfg.latent_channels = args.latent_channels
+    if getattr(args, "encoder_depth", None) is not None:
+        cfg.encoder_depth = max(1, args.encoder_depth)
+    if getattr(args, "coarse_channels", None) is not None:
+        cfg.coarse_output_channels = max(1, args.coarse_channels)
+    if getattr(args, "lambda_l1", None) is not None:
+        cfg.lambda_l1 = args.lambda_l1
+    if getattr(args, "lambda_sam", None) is not None:
+        cfg.lambda_sam = args.lambda_sam
+    if getattr(args, "lambda_sid", None) is not None:
+        cfg.lambda_sid = args.lambda_sid
+    if getattr(args, "lambda_srgb_l1", None) is not None:
+        cfg.lambda_srgb_l1 = args.lambda_srgb_l1
+    if getattr(args, "lambda_srgb_ssim", None) is not None:
+        cfg.lambda_srgb_ssim = args.lambda_srgb_ssim
+    if getattr(args, "lambda_ergas", None) is not None:
+        cfg.lambda_ergas = args.lambda_ergas
+    if getattr(args, "lr_scheduler", None) is not None:
+        cfg.lr_scheduler = args.lr_scheduler.lower()
+    if getattr(args, "scheduler_warmup_epochs", None) is not None:
+        cfg.scheduler_warmup_epochs = args.scheduler_warmup_epochs
+    if getattr(args, "scheduler_warmup_start_factor", None) is not None:
+        cfg.scheduler_warmup_start_factor = args.scheduler_warmup_start_factor
+    if getattr(args, "scheduler_min_lr", None) is not None:
+        cfg.scheduler_min_lr = args.scheduler_min_lr
+
+    set_seed(cfg.seed)
+
+    device = torch.device(cfg.device)
+    model_runs_root = Path(__file__).resolve().parent / "models" / "simple_cnn" / "runs"
+    run_dir = model_runs_root / cfg.run_name
+    ckpt_dir = run_dir / "checkpoints"
+    metrics_dir = run_dir / "metrics"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    history_path = metrics_dir / "metrics.json"
+    legacy_history_path = run_dir / "metrics.json"
+    if legacy_history_path.exists() and not history_path.exists():
+        try:
+            legacy_history_path.replace(history_path)
+            logger.info("[Metrics] Migrated legacy metrics.json into %s", metrics_dir)
+        except OSError as exc:
+            logger.warning(
+                "[Metrics] Failed to move legacy metrics.json (%s); will read inline.", exc
+            )
+            history_path = legacy_history_path
+    try:
+        history: list[Dict[str, Any]] = load_metrics_history(history_path)
+    except ValueError as exc:
+        logger.warning("%s; starting a new metrics log.", exc)
+        history = []
+
+    resize_info = cfg.resize_to if cfg.resize_to is not None else "native"
+    cache_info = cfg.cache_dir if cfg.cache_dir is not None else "disabled"
+    cache_mode = "rw" if cfg.write_cache else "ro"
+    logger.info(
+        "[Setup] device=%s | data_root=%s | resize=%s | cache=%s (%s) | variant=%s | run_dir=%s",
+        device,
+        cfg.data_root,
+        resize_info,
+        cache_info,
+        cache_mode,
+        cfg.model_variant,
+        run_dir,
+    )
+    logger.info(
+        "[Loss] lambda_l1=%.3f | lambda_sam=%.3f | lambda_sid=%.3f | "
+        "lambda_ergas=%.3f | lambda_srgb_l1=%.3f | lambda_srgb_ssim=%.3f",
+        cfg.lambda_l1,
+        cfg.lambda_sam,
+        cfg.lambda_sid,
+        cfg.lambda_ergas,
+        cfg.lambda_srgb_l1,
+        cfg.lambda_srgb_ssim,
+    )
+    if _PROCESS is None:
+        logger.warning("psutil not available; RAM telemetry disabled.")
+
+    train_loader, val_loader = create_dataloaders(cfg)
+
+    model = create_model(
+        cfg.model_variant,
+        in_channels=cfg.input_channels,
+        out_channels=cfg.output_channels,
+        coarse_channels=cfg.coarse_output_channels,
+        hidden_channels=cfg.hidden_channels,
+        train_resolution=cfg.resize_to,
+        unet_base_channels=cfg.unet_base_channels,
+        latent_channels=cfg.latent_channels,
+        encoder_depth=cfg.encoder_depth,
+    ).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "[Model] variant=%s | params=%.2fM",
+        getattr(model, "variant_name", cfg.model_variant),
+        num_params / 1e6,
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+    )
+    scheduler = create_scheduler(optimizer, cfg)
+    loss_fn = CompositeSpectralLoss(
+        LossWeights(
+            lambda_l1=cfg.lambda_l1,
+            lambda_sam=cfg.lambda_sam,
+            lambda_sid=cfg.lambda_sid,
+            lambda_ergas=cfg.lambda_ergas,
+            lambda_srgb_l1=cfg.lambda_srgb_l1,
+            lambda_srgb_ssim=cfg.lambda_srgb_ssim,
+        )
+    )
+
+    best_val = float("inf")
+
+    for epoch in range(1, cfg.epochs + 1):
+        if scheduler is not None:
+            current_lr = scheduler.step(epoch - 1)
+        else:
+            current_lr = optimizer.param_groups[0]["lr"]
+        train_stats = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            loss_fn,
+            cfg.log_interval,
+            epoch,
+            cfg.train_inference_resize,
+        )
+        train_stats["lr"] = current_lr
+        logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
+        msg = (
+            "Epoch %d timing (ms): io=%.2f | preprocess=%.2f | forward=%.2f | "
+            "backward=%.2f | interp=%.2f"
+        )
+        args = [
+            epoch,
+            train_stats["io"] * 1e3,
+            train_stats["preprocess"] * 1e3,
+            train_stats["forward"] * 1e3,
+            train_stats["backward"] * 1e3,
+            train_stats["interp"] * 1e3,
+        ]
+        if _PROCESS is not None and train_stats.get("ram_mb") is not None:
+            msg += " | ram=%.1f MB"
+            args.append(train_stats["ram_mb"])
+        logger.info(msg, *args)
+
+        train_timestamp = utc_timestamp()
+        record: Dict[str, Any] = {
+            "epoch": epoch,
+            "timestamp": train_timestamp,
+            "train": train_stats,
+            "units": {
+                "train": units_from_defaults(train_stats.keys(), TRAINING_METRIC_UNITS)
+            },
+            "context": {
+                "train": {
+                    "source": SOURCE_TRAIN,
+                    "resolution": resolution_label(cfg.resize_to),
+                }
+            },
+            "updated": {"train": train_timestamp},
+        }
+
+        if epoch % cfg.val_interval == 0:
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                device,
+                loss_fn,
+                cfg.train_inference_resize,
+            )
+            metrics_str = " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+            logger.info("[Val] Epoch %d | %s", epoch, metrics_str)
+            val_section = f"val_{resolution_tag(cfg.resize_to)}"
+            val_units = units_from_defaults(val_metrics.keys(), ACCURACY_METRIC_UNITS)
+            val_timestamp = utc_timestamp()
+
+            record[val_section] = val_metrics
+            record["units"][val_section] = val_units
+            record["context"][val_section] = {
+                "source": SOURCE_TRAIN,
+                "resolution": resolution_label(cfg.resize_to),
+            }
+            record["updated"][val_section] = val_timestamp
+
+            # Backwards compatibility alias
+            record["val"] = val_metrics
+            record["units"]["val"] = dict(val_units)
+            record["context"]["val"] = dict(record["context"][val_section])
+            record["updated"]["val"] = val_timestamp
+
+            if val_metrics["loss"] < best_val:
+                best_val = val_metrics["loss"]
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    ckpt_dir / "model_best.pt",
+                    cfg.model_variant,
+                )
+
+        if epoch % cfg.checkpoint_every == 0:
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                ckpt_dir / f"model_epoch_{epoch:03d}.pt",
+                cfg.model_variant,
+            )
+
+        # Update metrics history log
+        remove_epoch_record(history, epoch)
+        history.append(record)
+        history.sort(key=lambda item: item.get("epoch", 0))
+        save_metrics_history(history_path, history)
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train Simple Track 1 model")
+    parser.add_argument("--data-root", type=str, default=None, help="Path to data/track1 directory")
+    parser.add_argument("--run-name", type=str, default=None, help="Name of the run subdirectory under the model's runs folder")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--hidden-channels", type=int, default=None)
+    parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument(
+        "--resize-to",
+        type=int,
+        default=None,
+        help="Optional spatial size to resize inputs/targets to (e.g., 64).",
+    )
+    parser.add_argument(
+        "--train-inference-resize",
+        type=int,
+        default=None,
+        help="Optional spatial size to downsample inputs before the model forward; loss is still computed at native resolution.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=None,
+        help="DataLoader prefetch factor (requires num_workers > 0).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Base directory for resized cache (use 'none' to disable).",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable reading from disk cache even if available.",
+    )
+    parser.add_argument(
+        "--no-write-cache",
+        action="store_true",
+        help="Do not write resized samples to disk cache.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Python logging level (e.g., DEBUG, INFO, WARNING).",
+    )
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        default=None,
+        help="Model architecture variant to use (baseline, unet_lite).",
+    )
+    parser.add_argument(
+        "--unet-base-channels",
+        type=int,
+        default=None,
+        help="Base channel count for UNet-lite variant (default 32).",
+    )
+    parser.add_argument(
+        "--latent-channels",
+        type=int,
+        default=None,
+        help="Latent channel width inside the UNet-lite decoder head (default 32).",
+    )
+    parser.add_argument(
+        "--encoder-depth",
+        type=int,
+        default=None,
+        help="Number of stride-2 encoder stages for UNet-lite (default 3).",
+    )
+    parser.add_argument(
+        "--coarse-channels",
+        type=int,
+        default=None,
+        help="Number of coarse spectral channels before interpolation (default from config).",
+    )
+    parser.add_argument(
+        "--lambda-l1",
+        type=float,
+        default=None,
+        help="Weight for L1 loss term (default 1.0).",
+    )
+    parser.add_argument(
+        "--lambda-sam",
+        type=float,
+        default=None,
+        help="Weight for SAM loss term (default 0.1).",
+    )
+    parser.add_argument(
+        "--lambda-sid",
+        type=float,
+        default=None,
+        help="Weight for SID loss term (default 0.0).",
+    )
+    parser.add_argument(
+        "--lambda-ergas",
+        type=float,
+        default=None,
+        help="Weight for ERGAS loss term (default 0.0).",
+    )
+    parser.add_argument(
+        "--lambda-srgb-l1",
+        type=float,
+        default=None,
+        help="Weight for sRGB linear L1 loss term (default 0.0).",
+    )
+    parser.add_argument(
+        "--lambda-srgb-ssim",
+        type=float,
+        default=None,
+        help="Weight for sRGB SSIM perceptual loss term (default 0.0).",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        default=None,
+        help="Learning rate scheduler to use (none, cosine).",
+    )
+    parser.add_argument(
+        "--scheduler-warmup-epochs",
+        type=int,
+        default=None,
+        help="Number of warmup epochs before cosine decay.",
+    )
+    parser.add_argument(
+        "--scheduler-warmup-start-factor",
+        type=float,
+        default=None,
+        help="Starting factor for warmup relative to base LR (default 0.1).",
+    )
+    parser.add_argument(
+        "--scheduler-min-lr",
+        type=float,
+        default=None,
+        help="Minimum LR reached by the cosine scheduler.",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_argparser()
+    args = parser.parse_args()
+    main(args)
+
+
