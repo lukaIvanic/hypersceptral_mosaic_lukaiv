@@ -311,6 +311,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.write_cache = False
     if getattr(args, "ram_cache", False):
         cfg.ram_cache = True
+    if getattr(args, "resume", False):
+        cfg.resume = True
     if args.device is not None:
         cfg.device = args.device
     if args.hidden_channels is not None:
@@ -381,18 +383,35 @@ def main(args: argparse.Namespace) -> None:
         logger.warning("%s; starting a new metrics log.", exc)
         history = []
 
+    history_best_val = float("inf")
+    last_logged_epoch = 0
+    for record in history:
+        epoch_value = record.get("epoch")
+        if isinstance(epoch_value, (int, float)):
+            last_logged_epoch = max(last_logged_epoch, int(epoch_value))
+        val_metrics = record.get("val")
+        if isinstance(val_metrics, dict) and "loss" in val_metrics:
+            try:
+                loss_value = float(val_metrics["loss"])
+            except (TypeError, ValueError):
+                continue
+            if loss_value < history_best_val:
+                history_best_val = loss_value
+
     resize_info = cfg.resize_to if cfg.resize_to is not None else "native"
     cache_info = cfg.cache_dir if cfg.cache_dir is not None else "disabled"
     cache_mode = "rw" if cfg.write_cache else "ro"
     ram_cache_info = "on" if cfg.ram_cache else "off"
+    resume_info = "on" if cfg.resume else "off"
     logger.info(
-        "[Setup] device=%s | data_root=%s | resize=%s | cache=%s (%s) | ram_cache=%s | variant=%s | run_dir=%s",
+        "[Setup] device=%s | data_root=%s | resize=%s | cache=%s (%s) | ram_cache=%s | resume=%s | variant=%s | run_dir=%s",
         device,
         cfg.data_root,
         resize_info,
         cache_info,
         cache_mode,
         ram_cache_info,
+        resume_info,
         cfg.model_variant,
         run_dir,
     )
@@ -446,9 +465,54 @@ def main(args: argparse.Namespace) -> None:
         )
     )
 
-    best_val = float("inf")
+    best_val = history_best_val if history_best_val < float("inf") else float("inf")
+    start_epoch = 1
 
-    for epoch in range(1, cfg.epochs + 1):
+    if cfg.resume:
+        last_ckpt_epoch = 0
+        last_ckpt_path: Optional[Path] = None
+        for ckpt_path in sorted(ckpt_dir.glob("model_epoch_*.pt")):
+            try:
+                epoch_num = int(ckpt_path.stem.split("_")[-1])
+            except ValueError:
+                continue
+            if epoch_num > last_ckpt_epoch:
+                last_ckpt_epoch = epoch_num
+                last_ckpt_path = ckpt_path
+
+        if last_ckpt_path is None:
+            logger.warning(
+                "[Resume] Requested but no checkpoint found in %s (last logged epoch=%d); starting from scratch.",
+                ckpt_dir,
+                last_logged_epoch,
+            )
+        else:
+            checkpoint = torch.load(last_ckpt_path, map_location=device)
+            model.load_state_dict(checkpoint["model"])
+            optimizer_state = checkpoint.get("optimizer")
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
+            saved_epoch = int(checkpoint.get("epoch", last_ckpt_epoch))
+            start_epoch = saved_epoch + 1
+            logger.info(
+                "[Resume] Loaded checkpoint %s (epoch=%d); resuming from epoch %d.",
+                last_ckpt_path.name,
+                saved_epoch,
+                start_epoch,
+            )
+
+    if best_val < float("inf"):
+        logger.info("[Progress] Historical best validation loss: %.4f", best_val)
+
+    if start_epoch > cfg.epochs:
+        logger.info(
+            "[Resume] Last completed epoch %d >= requested epochs %d; nothing to do.",
+            start_epoch - 1,
+            cfg.epochs,
+        )
+        return
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
         if scheduler is not None:
             current_lr = scheduler.step(epoch - 1)
         else:
@@ -603,6 +667,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--ram-cache",
         action="store_true",
         help="Keep decoded samples in RAM after first access (may require large memory).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the most recent epoch checkpoint for the run.",
     )
     parser.add_argument(
         "--log-level",

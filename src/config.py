@@ -42,6 +42,7 @@ class TrainConfig:
     cache_dir: Path | None = Path("data/cache/track1")
     write_cache: bool = True
     ram_cache: bool = False
+    resume: bool = False
 
     # Logging/checkpointing cadence
     log_interval: int = 20
