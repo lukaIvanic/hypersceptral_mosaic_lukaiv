@@ -309,6 +309,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.cache_dir = None
     if args.no_write_cache:
         cfg.write_cache = False
+    if getattr(args, "ram_cache", False):
+        cfg.ram_cache = True
     if args.device is not None:
         cfg.device = args.device
     if args.hidden_channels is not None:
@@ -382,13 +384,15 @@ def main(args: argparse.Namespace) -> None:
     resize_info = cfg.resize_to if cfg.resize_to is not None else "native"
     cache_info = cfg.cache_dir if cfg.cache_dir is not None else "disabled"
     cache_mode = "rw" if cfg.write_cache else "ro"
+    ram_cache_info = "on" if cfg.ram_cache else "off"
     logger.info(
-        "[Setup] device=%s | data_root=%s | resize=%s | cache=%s (%s) | variant=%s | run_dir=%s",
+        "[Setup] device=%s | data_root=%s | resize=%s | cache=%s (%s) | ram_cache=%s | variant=%s | run_dir=%s",
         device,
         cfg.data_root,
         resize_info,
         cache_info,
         cache_mode,
+        ram_cache_info,
         cfg.model_variant,
         run_dir,
     )
@@ -594,6 +598,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--no-write-cache",
         action="store_true",
         help="Do not write resized samples to disk cache.",
+    )
+    parser.add_argument(
+        "--ram-cache",
+        action="store_true",
+        help="Keep decoded samples in RAM after first access (may require large memory).",
     )
     parser.add_argument(
         "--log-level",

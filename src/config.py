@@ -41,6 +41,7 @@ class TrainConfig:
     train_inference_resize: int | None = None
     cache_dir: Path | None = Path("data/cache/track1")
     write_cache: bool = True
+    ram_cache: bool = False
 
     # Logging/checkpointing cadence
     log_interval: int = 20

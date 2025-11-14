@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from .config import TrainConfig
 
 TensorDict = Dict[str, torch.Tensor]
+CacheEntry = Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]
 
 
 def _load_mosaic(path: Path) -> torch.Tensor:
@@ -100,6 +101,7 @@ class Track1Dataset(Dataset):
         resize_to: Optional[int] = None,
         cache_dir: Optional[Path] = None,
         write_cache: bool = True,
+        ram_cache: bool = False,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -107,6 +109,7 @@ class Track1Dataset(Dataset):
         self.augment = augment
         self.resize_to = resize_to
         self.write_cache = write_cache
+        self.ram_cache = ram_cache
 
         if split == "train":
             mosaic_dir = self.root / "train" / "mosaic"
@@ -136,6 +139,7 @@ class Track1Dataset(Dataset):
 
         self.ids = [p.stem for p in self.mosaic_paths]
         self._h5_files: Dict[str, h5py.File] = {}
+        self._ram_cache: Dict[str, CacheEntry] = {}
         if cache_dir is not None and self.resize_to is not None:
             self.cache_dir = Path(cache_dir) / f"size{self.resize_to}" / self.split
         else:
@@ -147,6 +151,7 @@ class Track1Dataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_h5_files"] = {}
+        state["_ram_cache"] = {}
         return state
 
     def __del__(self):
@@ -160,15 +165,36 @@ class Track1Dataset(Dataset):
         mosaic_path = self.mosaic_paths[idx]
         sample_id = mosaic_path.stem
 
-        if self.cache_dir is not None:
-            mosaic, cube, orig_shape = self._load_cached_sample(mosaic_path, sample_id)
+        cached_entry: Optional[CacheEntry] = None
+        if self.ram_cache:
+            cached_entry = self._ram_cache.get(sample_id)
+
+        if cached_entry is not None:
+            base_mosaic, base_cube, orig_shape = cached_entry
+            mosaic = base_mosaic.clone()
+            cube = base_cube.clone() if base_cube.numel() > 0 else base_cube
+            logger.debug("ram-cache-hit: %s split=%s", sample_id, self.split)
         else:
-            mosaic, cube, orig_shape = self._load_raw_sample(mosaic_path, sample_id)
-            if self.resize_to is not None:
-                size = (self.resize_to, self.resize_to)
-                mosaic = _resize_tensor(mosaic, size, mode="area")
-                if cube.numel() > 0:
-                    cube = _resize_tensor(cube, size, mode="area")
+            if self.cache_dir is not None:
+                mosaic, cube, orig_shape = self._load_cached_sample(mosaic_path, sample_id)
+            else:
+                mosaic, cube, orig_shape = self._load_raw_sample(mosaic_path, sample_id)
+                if self.resize_to is not None:
+                    size = (self.resize_to, self.resize_to)
+                    mosaic = _resize_tensor(mosaic, size, mode="area")
+                    if cube.numel() > 0:
+                        cube = _resize_tensor(cube, size, mode="area")
+
+            if self.ram_cache and sample_id not in self._ram_cache:
+                stored_mosaic = mosaic.detach().clone()
+                stored_cube = cube.detach().clone() if cube.numel() > 0 else cube
+                self._ram_cache[sample_id] = (stored_mosaic, stored_cube, orig_shape)
+                logger.debug(
+                    "ram-cache-store: %s split=%s | entries=%d",
+                    sample_id,
+                    self.split,
+                    len(self._ram_cache),
+                )
 
         example: TensorDict = {
             "input": mosaic,
@@ -312,6 +338,7 @@ def create_dataloaders(
         resize_to=cfg.resize_to,
         cache_dir=cfg.cache_dir,
         write_cache=cfg.write_cache,
+        ram_cache=cfg.ram_cache,
     )
     val_ds = Track1Dataset(
         root=cfg.data_root,
@@ -320,6 +347,7 @@ def create_dataloaders(
         resize_to=cfg.resize_to,
         cache_dir=cfg.cache_dir,
         write_cache=cfg.write_cache,
+        ram_cache=cfg.ram_cache,
     )
 
     train_loader = DataLoader(
