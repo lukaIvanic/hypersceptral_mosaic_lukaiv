@@ -46,6 +46,39 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--latent-channels", type=int, default=None, help="Latent channel width for UNet-lite variants.")
     parser.add_argument("--encoder-depth", type=int, default=None, help="Number of stride-2 encoder stages for UNet-lite.")
     parser.add_argument("--coarse-channels", type=int, default=None, help="Number of coarse spectral channels before interpolation.")
+    parser.add_argument(
+        "--use-residual-head",
+        action="store_true",
+        help="Enable coarse+residual refinement head (must match training).",
+    )
+    parser.add_argument(
+        "--use-spectral-conv",
+        action="store_true",
+        help="Enable spectral 1D convolution after the 61-band head (must match training).",
+    )
+    parser.add_argument(
+        "--spectral-conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for spectral 1D convolution (odd, e.g., 3 or 5).",
+    )
+    parser.add_argument(
+        "--use-bottleneck-attention",
+        action="store_true",
+        help="Enable compact attention block in the bottleneck (must match training).",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Dropout probability in decoder/bottleneck residual blocks.",
+    )
+    parser.add_argument(
+        "--stochastic-depth-p",
+        type=float,
+        default=None,
+        help="Stochastic depth drop probability for decoder/bottleneck blocks.",
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for validation loader (default: 1).")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader worker processes.")
     parser.add_argument(
@@ -227,6 +260,18 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
         cfg.encoder_depth = max(1, args.encoder_depth)
     if args.coarse_channels is not None:
         cfg.coarse_output_channels = max(1, args.coarse_channels)
+    if args.use_residual_head:
+        cfg.use_residual_head = True
+    if args.use_spectral_conv:
+        cfg.use_spectral_conv = True
+    if args.spectral_conv_kernel_size is not None:
+        cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
+    if args.decoder_dropout is not None:
+        cfg.decoder_dropout = max(0.0, float(args.decoder_dropout))
+    if args.stochastic_depth_p is not None:
+        cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
+    if args.use_bottleneck_attention:
+        cfg.use_bottleneck_attention = True
     if args.cache_dir is not None:
         cfg.cache_dir = None if args.cache_dir.lower() in {"", "none"} else Path(args.cache_dir)
     if args.no_cache:
