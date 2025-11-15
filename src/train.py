@@ -355,6 +355,33 @@ def main(args: argparse.Namespace) -> None:
     if getattr(args, "scheduler_min_lr", None) is not None:
         cfg.scheduler_min_lr = args.scheduler_min_lr
 
+    # Data augmentation flags
+    if getattr(args, "aug_rotate90", False):
+        cfg.aug_rotate90 = True
+    if getattr(args, "aug_resized_crop", False):
+        cfg.aug_resized_crop = True
+    if getattr(args, "aug_intensity_jitter", False):
+        cfg.aug_intensity_jitter = True
+
+    # Advanced model options
+    if getattr(args, "use_residual_head", False):
+        cfg.use_residual_head = True
+    if getattr(args, "use_spectral_conv", False):
+        cfg.use_spectral_conv = True
+    if getattr(args, "spectral_conv_kernel_size", None) is not None:
+        cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
+    if getattr(args, "use_bottleneck_attention", False):
+        cfg.use_bottleneck_attention = True
+
+    # Regularization options
+    if getattr(args, "decoder_dropout", None) is not None:
+        cfg.decoder_dropout = max(0.0, float(args.decoder_dropout))
+    if getattr(args, "stochastic_depth_p", None) is not None:
+        cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
+
+    if getattr(args, "resume", False) and getattr(args, "init_from", None):
+        raise ValueError("Cannot use --resume and --init-from together.")
+
     set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
@@ -440,7 +467,23 @@ def main(args: argparse.Namespace) -> None:
         unet_base_channels=cfg.unet_base_channels,
         latent_channels=cfg.latent_channels,
         encoder_depth=cfg.encoder_depth,
+        use_residual_head=cfg.use_residual_head,
+        use_spectral_conv=cfg.use_spectral_conv,
+        spectral_conv_kernel_size=cfg.spectral_conv_kernel_size,
+        decoder_dropout=cfg.decoder_dropout,
+        stochastic_depth_p=cfg.stochastic_depth_p,
+        use_bottleneck_attention=cfg.use_bottleneck_attention,
     ).to(device)
+    init_from = getattr(args, "init_from", None)
+    if init_from:
+        ckpt_path = Path(init_from)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"--init-from checkpoint not found: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        state_dict = checkpoint.get("model", checkpoint)
+        model.load_state_dict(state_dict, strict=True)
+        logger.info("[Init] Loaded weights from %s", ckpt_path)
+
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(
         "[Model] variant=%s | params=%.2fM",
@@ -768,6 +811,60 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Minimum LR reached by the cosine scheduler.",
+    )
+    parser.add_argument(
+        "--aug-rotate90",
+        action="store_true",
+        help="Enable random 90-degree rotations for train samples.",
+    )
+    parser.add_argument(
+        "--aug-resized-crop",
+        action="store_true",
+        help="Enable mild random resized crop jitter for train samples.",
+    )
+    parser.add_argument(
+        "--aug-intensity-jitter",
+        action="store_true",
+        help="Enable mild brightness/contrast jitter for train samples.",
+    )
+    parser.add_argument(
+        "--use-residual-head",
+        action="store_true",
+        help="Enable coarse+residual refinement head in UNet-lite.",
+    )
+    parser.add_argument(
+        "--use-spectral-conv",
+        action="store_true",
+        help="Enable 1D spectral convolution after the 61-band head.",
+    )
+    parser.add_argument(
+        "--spectral-conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for spectral 1D convolution (odd, e.g., 3 or 5).",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Dropout probability in bottleneck/decoder residual blocks.",
+    )
+    parser.add_argument(
+        "--stochastic-depth-p",
+        type=float,
+        default=None,
+        help="Stochastic depth drop probability for bottleneck/decoder blocks.",
+    )
+    parser.add_argument(
+        "--use-bottleneck-attention",
+        action="store_true",
+        help="Enable compact channel attention in the UNet-lite bottleneck.",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint (.pt) used to initialize model weights (no optimizer resume).",
     )
     return parser
 

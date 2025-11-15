@@ -69,6 +69,21 @@ class TrainConfig:
     scheduler_warmup_start_factor: float = 0.1
     scheduler_min_lr: float = 1e-5
 
+    # Data augmentation flags
+    aug_rotate90: bool = False
+    aug_resized_crop: bool = False
+    aug_intensity_jitter: bool = False
+
+    # Advanced model options
+    use_residual_head: bool = False
+    use_spectral_conv: bool = False
+    spectral_conv_kernel_size: int = 3
+    use_bottleneck_attention: bool = False
+
+    # Regularization
+    decoder_dropout: float = 0.0
+    stochastic_depth_p: float = 0.0
+
 
 __all__ = ["TrainConfig"]
 

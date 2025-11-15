@@ -16,7 +16,14 @@ def _make_group_norm(channels: int) -> nn.GroupNorm:
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+        stochastic_depth: float = 0.0,
+    ) -> None:
         super().__init__()
         padding = kernel_size // 2
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
@@ -29,14 +36,27 @@ class ResidualBlock(nn.Module):
         else:
             self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
+        self.dropout = float(max(dropout, 0.0))
+        self.stochastic_depth = float(max(stochastic_depth, 0.0))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.proj(x)
         out = self.conv1(x)
         out = self.norm1(out)
         out = self.act(out)
+        if self.dropout > 0.0:
+            out = F.dropout(out, p=self.dropout, training=self.training)
         out = self.conv2(out)
         out = self.norm2(out)
-        out = out + residual
+
+        if self.stochastic_depth > 0.0 and self.training:
+            if torch.rand(1, device=out.device).item() < self.stochastic_depth:
+                out = residual
+            else:
+                out = out + residual
+        else:
+            out = out + residual
+
         return self.act(out)
 
 
@@ -54,9 +74,23 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+        stochastic_depth: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.block = ResidualBlock(in_channels + skip_channels, out_channels, kernel_size=kernel_size)
+        self.block = ResidualBlock(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            stochastic_depth=stochastic_depth,
+        )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
@@ -92,6 +126,12 @@ class UNetLiteHSI(nn.Module):
         encoder_depth: int = 3,
         train_resolution: int | None = None,
         pixel_factor: int = 2,
+        use_residual_head: bool = False,
+        use_spectral_conv: bool = False,
+        spectral_conv_kernel_size: int = 3,
+        decoder_dropout: float = 0.0,
+        stochastic_depth_p: float = 0.0,
+        use_bottleneck_attention: bool = False,
     ) -> None:
         super().__init__()
         if encoder_depth < 1:
@@ -108,6 +148,12 @@ class UNetLiteHSI(nn.Module):
         self.latent_channels = latent_channels
         self.encoder_depth = encoder_depth
         self.last_interp_time: float = 0.0
+
+        self.use_residual_head = bool(use_residual_head)
+        self.use_spectral_conv = bool(use_spectral_conv)
+        self.use_bottleneck_attention = bool(use_bottleneck_attention)
+        self.decoder_dropout = float(max(decoder_dropout, 0.0))
+        self.stochastic_depth_p = float(max(stochastic_depth_p, 0.0))
 
         stem_channels = in_channels * (pixel_factor**2)
         self.activation = nn.GELU()
@@ -129,7 +175,12 @@ class UNetLiteHSI(nn.Module):
             self.down_blocks.append(DownBlock(in_ch, out_ch))
 
         bottleneck_channels = channel_progression[-1]
-        self.bottleneck = ResidualBlock(bottleneck_channels, bottleneck_channels)
+        self.bottleneck = ResidualBlock(
+            bottleneck_channels,
+            bottleneck_channels,
+            dropout=self.decoder_dropout,
+            stochastic_depth=self.stochastic_depth_p,
+        )
 
         skip_channels = channel_progression[1:]
         decoder_channels = list(reversed(channel_progression[:-1]))
@@ -137,7 +188,15 @@ class UNetLiteHSI(nn.Module):
         self.up_blocks = nn.ModuleList()
         current_channels = bottleneck_channels
         for out_ch, skip_ch in zip(decoder_channels, reversed(skip_channels)):
-            self.up_blocks.append(UpBlock(current_channels, skip_ch, out_ch))
+            self.up_blocks.append(
+                UpBlock(
+                    current_channels,
+                    skip_ch,
+                    out_ch,
+                    dropout=self.decoder_dropout,
+                    stochastic_depth=self.stochastic_depth_p,
+                )
+            )
             current_channels = out_ch
 
         self.merge = ResidualBlock(current_channels + channel_progression[0], channel_progression[0])
@@ -145,6 +204,47 @@ class UNetLiteHSI(nn.Module):
         self.latent_proj = nn.Conv2d(channel_progression[0], latent_unshuffle_channels, kernel_size=1)
         self.latent_norm = _make_group_norm(latent_channels)
         self.coarse_head = nn.Conv2d(latent_channels, coarse_channels, kernel_size=1)
+
+        # Optional coarse + residual refinement head
+        if self.use_residual_head:
+            residual_in = latent_channels + out_channels
+            residual_hidden = max(latent_channels, out_channels)
+            self.residual_head = nn.Sequential(
+                ResidualBlock(residual_in, residual_hidden),
+                ResidualBlock(residual_hidden, residual_hidden),
+                nn.Conv2d(residual_hidden, out_channels, kernel_size=1),
+            )
+        else:
+            self.residual_head = None
+
+        # Optional 1D spectral convolution for per-pixel smoothing
+        if self.use_spectral_conv:
+            k = max(1, int(spectral_conv_kernel_size))
+            if k % 2 == 0:
+                k += 1
+            self.spectral_conv = nn.Conv1d(
+                out_channels,
+                out_channels,
+                kernel_size=k,
+                padding=k // 2,
+                groups=1,
+            )
+        else:
+            self.spectral_conv = None
+
+        # Optional bottleneck channel attention
+        if self.use_bottleneck_attention:
+            reduction = 8
+            reduced = max(1, bottleneck_channels // reduction)
+            self.bottleneck_attn = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(bottleneck_channels, reduced, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(reduced, bottleneck_channels, kernel_size=1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.bottleneck_attn = None
 
         self.required_divisor = pixel_factor * (2 ** encoder_depth)
 
@@ -176,6 +276,9 @@ class UNetLiteHSI(nn.Module):
             skips.append(skip)
 
         x_bottleneck = self.bottleneck(x_encoded)
+        if self.bottleneck_attn is not None:
+            attn = self.bottleneck_attn(x_bottleneck)
+            x_bottleneck = x_bottleneck * attn
 
         x_decoded = x_bottleneck
         for block in self.up_blocks:
@@ -200,6 +303,20 @@ class UNetLiteHSI(nn.Module):
         )
         upsampled = upsampled.view(-1, coarse.shape[1], coarse.shape[2], self.out_channels)
         spectral = upsampled.permute(0, 3, 1, 2).contiguous()
+
+        # Optional residual refinement using decoder features
+        if self.residual_head is not None:
+            residual_input = torch.cat([latent, spectral], dim=1)
+            residual = self.residual_head(residual_input)
+            spectral = spectral + residual
+
+        # Optional spectral 1D convolution for smooth spectra per pixel
+        if self.spectral_conv is not None:
+            b, c, h, w = spectral.shape
+            spectral_flat = spectral.view(b, c, -1)
+            spectral_flat = self.spectral_conv(spectral_flat)
+            spectral = spectral_flat.view(b, c, h, w)
+
         output = torch.sigmoid(spectral)
         self.last_interp_time = 0.0
         return output

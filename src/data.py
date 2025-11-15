@@ -80,6 +80,113 @@ def random_flip(sample: TensorDict) -> TensorDict:
     return sample
 
 
+def random_rotate_90(sample: TensorDict) -> TensorDict:
+    """
+    Apply a shared random 90° rotation to input and target.
+    """
+    k = random.randint(0, 3)
+    if k:
+        sample["input"] = torch.rot90(sample["input"], k, dims=(1, 2))
+        if sample["target"].numel() > 0:
+            sample["target"] = torch.rot90(sample["target"], k, dims=(1, 2))
+    return sample
+
+
+def random_resized_crop(
+    sample: TensorDict,
+    min_scale: float = 0.9,
+    max_scale: float = 1.0,
+) -> TensorDict:
+    """
+    Random resized crop within the existing spatial support.
+
+    The crop is rescaled back to the original H×W to keep tensor shapes fixed.
+    """
+    if not (0.0 < min_scale <= max_scale <= 1.0):
+        return sample
+
+    mosaic = sample["input"]
+    cube = sample["target"]
+    if mosaic.dim() != 3:
+        return sample
+
+    _, h, w = mosaic.shape
+    if h < 2 or w < 2:
+        return sample
+
+    scale = random.uniform(min_scale, max_scale)
+    crop_h = max(1, int(round(h * scale)))
+    crop_w = max(1, int(round(w * scale)))
+    if crop_h == h and crop_w == w:
+        return sample
+
+    top = random.randint(0, h - crop_h)
+    left = random.randint(0, w - crop_w)
+
+    mosaic_crop = mosaic[:, top : top + crop_h, left : left + crop_w]
+    if cube.numel() > 0:
+        cube_crop = cube[:, top : top + crop_h, left : left + crop_w]
+    else:
+        cube_crop = cube
+
+    mosaic_resized = F.interpolate(
+        mosaic_crop.unsqueeze(0),
+        size=(h, w),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    if cube_crop.numel() > 0:
+        cube_resized = F.interpolate(
+            cube_crop.unsqueeze(0),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    else:
+        cube_resized = cube_crop
+
+    sample["input"] = mosaic_resized
+    sample["target"] = cube_resized
+    return sample
+
+
+def random_intensity_jitter(
+    sample: TensorDict,
+    brightness: float = 0.05,
+    contrast: float = 0.05,
+) -> TensorDict:
+    """
+    Mild brightness/contrast jitter applied identically to input and target.
+
+    Assumes inputs are in [0, 1] and clamps back to that range.
+    """
+    mosaic = sample["input"]
+    cube = sample["target"]
+
+    # Brightness jitter
+    if brightness > 0.0:
+        b_factor = 1.0 + random.uniform(-brightness, brightness)
+        mosaic = mosaic * b_factor
+        if cube.numel() > 0:
+            cube = cube * b_factor
+
+    # Contrast jitter
+    if contrast > 0.0:
+        c_factor = 1.0 + random.uniform(-contrast, contrast)
+        mosaic_mean = mosaic.mean(dim=(1, 2), keepdim=True)
+        mosaic = (mosaic - mosaic_mean) * c_factor + mosaic_mean
+        if cube.numel() > 0:
+            cube_mean = cube.mean(dim=(1, 2), keepdim=True)
+            cube = (cube - cube_mean) * c_factor + cube_mean
+
+    sample["input"] = torch.clamp(mosaic, 0.0, 1.0)
+    if cube.numel() > 0:
+        sample["target"] = torch.clamp(cube, 0.0, 1.0)
+    else:
+        sample["target"] = cube
+    return sample
+
+
 class Track1Dataset(Dataset):
     """
     Thin PyTorch dataset for Track 1.
@@ -331,6 +438,28 @@ def create_dataloaders(
     """
     Construct train/val dataloaders with shared configuration.
     """
+
+    def _build_train_transform(cfg: TrainConfig) -> Optional[Callable[[TensorDict], TensorDict]]:
+        transforms = []
+        if cfg.aug_rotate90:
+            transforms.append(random_rotate_90)
+        if cfg.aug_resized_crop:
+            transforms.append(lambda s: random_resized_crop(s, min_scale=0.9, max_scale=1.0))
+        if cfg.aug_intensity_jitter:
+            transforms.append(random_intensity_jitter)
+
+        if not transforms:
+            return None
+
+        def _apply(sample: TensorDict) -> TensorDict:
+            for t in transforms:
+                sample = t(sample)
+            return sample
+
+        return _apply
+
+    train_transform = _build_train_transform(cfg)
+
     train_ds = Track1Dataset(
         root=cfg.data_root,
         split="train",
@@ -339,6 +468,7 @@ def create_dataloaders(
         cache_dir=cfg.cache_dir,
         write_cache=cfg.write_cache,
         ram_cache=cfg.ram_cache,
+        transform=train_transform,
     )
     val_ds = Track1Dataset(
         root=cfg.data_root,

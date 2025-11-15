@@ -19,6 +19,12 @@ def create_model(
     unet_base_channels: int,
     latent_channels: int,
     encoder_depth: int,
+    use_residual_head: bool,
+    use_spectral_conv: bool,
+    spectral_conv_kernel_size: int,
+    decoder_dropout: float,
+    stochastic_depth_p: float,
+    use_bottleneck_attention: bool,
 ) -> nn.Module:
     variant_norm = variant.lower()
     if variant_norm == "baseline":
@@ -38,6 +44,12 @@ def create_model(
             latent_channels=latent_channels,
             encoder_depth=encoder_depth,
             train_resolution=train_resolution,
+            use_residual_head=use_residual_head,
+            use_spectral_conv=use_spectral_conv,
+            spectral_conv_kernel_size=spectral_conv_kernel_size,
+            decoder_dropout=decoder_dropout,
+            stochastic_depth_p=stochastic_depth_p,
+            use_bottleneck_attention=use_bottleneck_attention,
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite.")
 
