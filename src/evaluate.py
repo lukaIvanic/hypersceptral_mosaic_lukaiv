@@ -254,6 +254,12 @@ def load_model(
         unet_base_channels=cfg.unet_base_channels,
         latent_channels=cfg.latent_channels,
         encoder_depth=cfg.encoder_depth,
+        use_residual_head=cfg.use_residual_head,
+        use_spectral_conv=cfg.use_spectral_conv,
+        spectral_conv_kernel_size=cfg.spectral_conv_kernel_size,
+        decoder_dropout=cfg.decoder_dropout,
+        stochastic_depth_p=cfg.stochastic_depth_p,
+        use_bottleneck_attention=cfg.use_bottleneck_attention,
     ).to(device)
     model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -319,6 +325,18 @@ def main(args: argparse.Namespace) -> None:
         cfg.encoder_depth = max(1, args.encoder_depth)
     if getattr(args, "coarse_channels", None) is not None:
         cfg.coarse_output_channels = max(1, args.coarse_channels)
+    if getattr(args, "use_residual_head", False):
+        cfg.use_residual_head = True
+    if getattr(args, "use_spectral_conv", False):
+        cfg.use_spectral_conv = True
+    if getattr(args, "spectral_conv_kernel_size", None) is not None:
+        cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
+    if getattr(args, "decoder_dropout", None) is not None:
+        cfg.decoder_dropout = max(0.0, float(args.decoder_dropout))
+    if getattr(args, "stochastic_depth_p", None) is not None:
+        cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
+    if getattr(args, "use_bottleneck_attention", False):
+        cfg.use_bottleneck_attention = True
 
     device = torch.device(cfg.device)
 
@@ -662,6 +680,39 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of coarse spectral channels before interpolation (default from config).",
+    )
+    parser.add_argument(
+        "--use-residual-head",
+        action="store_true",
+        help="Enable coarse+residual refinement head (must match training).",
+    )
+    parser.add_argument(
+        "--use-spectral-conv",
+        action="store_true",
+        help="Enable 1D spectral convolution after the spectral head (must match training).",
+    )
+    parser.add_argument(
+        "--spectral-conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for spectral 1D convolution (odd, e.g., 3 or 5).",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Dropout probability for decoder/bottleneck residual blocks (must match training).",
+    )
+    parser.add_argument(
+        "--stochastic-depth-p",
+        type=float,
+        default=None,
+        help="Stochastic depth drop probability for decoder/bottleneck blocks (must match training).",
+    )
+    parser.add_argument(
+        "--use-bottleneck-attention",
+        action="store_true",
+        help="Enable compact attention in the bottleneck (must match training).",
     )
     parser.add_argument(
         "--resize-to",

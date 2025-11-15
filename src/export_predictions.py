@@ -52,6 +52,39 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=None,
         help="Number of coarse spectral channels before interpolation.",
     )
+    parser.add_argument(
+        "--use-residual-head",
+        action="store_true",
+        help="Enable coarse+residual refinement head (must match training).",
+    )
+    parser.add_argument(
+        "--use-spectral-conv",
+        action="store_true",
+        help="Enable 1D spectral convolution after the spectral head (must match training).",
+    )
+    parser.add_argument(
+        "--spectral-conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for spectral 1D convolution.",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Dropout probability for decoder/bottleneck residual blocks.",
+    )
+    parser.add_argument(
+        "--stochastic-depth-p",
+        type=float,
+        default=None,
+        help="Stochastic depth probability for decoder/bottleneck blocks.",
+    )
+    parser.add_argument(
+        "--use-bottleneck-attention",
+        action="store_true",
+        help="Enable bottleneck attention module (must match training).",
+    )
     parser.add_argument("--device", type=str, default=None, help="Torch device to run inference on.")
     parser.add_argument(
         "--inference-resize",
@@ -145,6 +178,18 @@ def export_predictions(args: argparse.Namespace) -> None:
         cfg.encoder_depth = max(1, args.encoder_depth)
     if args.coarse_channels is not None:
         cfg.coarse_output_channels = max(1, args.coarse_channels)
+    if args.use_residual_head:
+        cfg.use_residual_head = True
+    if args.use_spectral_conv:
+        cfg.use_spectral_conv = True
+    if args.spectral_conv_kernel_size is not None:
+        cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
+    if args.decoder_dropout is not None:
+        cfg.decoder_dropout = max(0.0, float(args.decoder_dropout))
+    if args.stochastic_depth_p is not None:
+        cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
+    if args.use_bottleneck_attention:
+        cfg.use_bottleneck_attention = True
     if args.device is not None:
         cfg.device = args.device
     if args.cache_dir is not None:
