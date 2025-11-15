@@ -61,7 +61,12 @@ class ResidualBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+    ) -> None:
         super().__init__()
         self.pre = ResidualBlock(in_channels, out_channels, kernel_size=kernel_size)
         self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
@@ -132,6 +137,7 @@ class UNetLiteHSI(nn.Module):
         decoder_dropout: float = 0.0,
         stochastic_depth_p: float = 0.0,
         use_bottleneck_attention: bool = False,
+        conv_kernel_size: int = 3,
     ) -> None:
         super().__init__()
         if encoder_depth < 1:
@@ -154,6 +160,7 @@ class UNetLiteHSI(nn.Module):
         self.use_bottleneck_attention = bool(use_bottleneck_attention)
         self.decoder_dropout = float(max(decoder_dropout, 0.0))
         self.stochastic_depth_p = float(max(stochastic_depth_p, 0.0))
+        self.conv_kernel_size = max(1, int(conv_kernel_size))
 
         stem_channels = in_channels * (pixel_factor**2)
         self.activation = nn.GELU()
@@ -172,12 +179,13 @@ class UNetLiteHSI(nn.Module):
         for idx in range(encoder_depth):
             in_ch = channel_progression[idx]
             out_ch = channel_progression[idx + 1]
-            self.down_blocks.append(DownBlock(in_ch, out_ch))
+            self.down_blocks.append(DownBlock(in_ch, out_ch, kernel_size=self.conv_kernel_size))
 
         bottleneck_channels = channel_progression[-1]
         self.bottleneck = ResidualBlock(
             bottleneck_channels,
             bottleneck_channels,
+            kernel_size=self.conv_kernel_size,
             dropout=self.decoder_dropout,
             stochastic_depth=self.stochastic_depth_p,
         )
@@ -193,13 +201,18 @@ class UNetLiteHSI(nn.Module):
                     current_channels,
                     skip_ch,
                     out_ch,
+                    kernel_size=self.conv_kernel_size,
                     dropout=self.decoder_dropout,
                     stochastic_depth=self.stochastic_depth_p,
                 )
             )
             current_channels = out_ch
 
-        self.merge = ResidualBlock(current_channels + channel_progression[0], channel_progression[0])
+        self.merge = ResidualBlock(
+            current_channels + channel_progression[0],
+            channel_progression[0],
+            kernel_size=self.conv_kernel_size,
+        )
         latent_unshuffle_channels = latent_channels * (pixel_factor**2)
         self.latent_proj = nn.Conv2d(channel_progression[0], latent_unshuffle_channels, kernel_size=1)
         self.latent_norm = _make_group_norm(latent_channels)
@@ -210,8 +223,8 @@ class UNetLiteHSI(nn.Module):
             residual_in = latent_channels + out_channels
             residual_hidden = max(latent_channels, out_channels)
             self.residual_head = nn.Sequential(
-                ResidualBlock(residual_in, residual_hidden),
-                ResidualBlock(residual_hidden, residual_hidden),
+                ResidualBlock(residual_in, residual_hidden, kernel_size=self.conv_kernel_size),
+                ResidualBlock(residual_hidden, residual_hidden, kernel_size=self.conv_kernel_size),
                 nn.Conv2d(residual_hidden, out_channels, kernel_size=1),
             )
         else:

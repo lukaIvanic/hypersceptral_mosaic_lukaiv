@@ -260,6 +260,7 @@ def load_model(
         decoder_dropout=cfg.decoder_dropout,
         stochastic_depth_p=cfg.stochastic_depth_p,
         use_bottleneck_attention=cfg.use_bottleneck_attention,
+        conv_kernel_size=cfg.conv_kernel_size,
     ).to(device)
     model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -325,6 +326,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.encoder_depth = max(1, args.encoder_depth)
     if getattr(args, "coarse_channels", None) is not None:
         cfg.coarse_output_channels = max(1, args.coarse_channels)
+    if getattr(args, "conv_kernel_size", None) is not None:
+        cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
     if getattr(args, "use_residual_head", False):
         cfg.use_residual_head = True
     if getattr(args, "use_spectral_conv", False):
@@ -713,6 +716,12 @@ def build_argparser() -> argparse.ArgumentParser:
         "--use-bottleneck-attention",
         action="store_true",
         help="Enable compact attention in the bottleneck (must match training).",
+    )
+    parser.add_argument(
+        "--conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for UNet-lite residual blocks (default 3; must match training).",
     )
     parser.add_argument(
         "--resize-to",

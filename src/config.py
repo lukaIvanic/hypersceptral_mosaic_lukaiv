@@ -79,6 +79,7 @@ class TrainConfig:
     use_spectral_conv: bool = False
     spectral_conv_kernel_size: int = 3
     use_bottleneck_attention: bool = False
+    conv_kernel_size: int = 3
 
     # Regularization
     decoder_dropout: float = 0.0

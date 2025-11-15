@@ -372,6 +372,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
     if getattr(args, "use_bottleneck_attention", False):
         cfg.use_bottleneck_attention = True
+    if getattr(args, "conv_kernel_size", None) is not None:
+        cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
 
     # Regularization options
     if getattr(args, "decoder_dropout", None) is not None:
@@ -473,6 +475,7 @@ def main(args: argparse.Namespace) -> None:
         decoder_dropout=cfg.decoder_dropout,
         stochastic_depth_p=cfg.stochastic_depth_p,
         use_bottleneck_attention=cfg.use_bottleneck_attention,
+        conv_kernel_size=cfg.conv_kernel_size,
     ).to(device)
     init_from = getattr(args, "init_from", None)
     if init_from:
@@ -859,6 +862,12 @@ def build_argparser() -> argparse.ArgumentParser:
         "--use-bottleneck-attention",
         action="store_true",
         help="Enable compact channel attention in the UNet-lite bottleneck.",
+    )
+    parser.add_argument(
+        "--conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for UNet-lite residual blocks (default 3).",
     )
     parser.add_argument(
         "--init-from",

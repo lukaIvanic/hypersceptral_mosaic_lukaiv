@@ -85,6 +85,12 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Enable bottleneck attention module (must match training).",
     )
+    parser.add_argument(
+        "--conv-kernel-size",
+        type=int,
+        default=None,
+        help="Kernel size for UNet-lite residual blocks (default 3; must match training).",
+    )
     parser.add_argument("--device", type=str, default=None, help="Torch device to run inference on.")
     parser.add_argument(
         "--inference-resize",
@@ -190,6 +196,8 @@ def export_predictions(args: argparse.Namespace) -> None:
         cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
     if args.use_bottleneck_attention:
         cfg.use_bottleneck_attention = True
+    if args.conv_kernel_size is not None:
+        cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
     if args.device is not None:
         cfg.device = args.device
     if args.cache_dir is not None:
