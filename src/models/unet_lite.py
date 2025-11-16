@@ -52,10 +52,12 @@ class RMSNorm2d(nn.Module):
 class IdentityNorm(nn.Module):
     def __init__(self, tag: str | None = None) -> None:
         super().__init__()
-        self._trace_name = tag or "identity_norm"
+        self._trace_name = tag
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with _record_scope(self._trace_name):
+        if self._trace_name is None or _record_function is None:
+            return x
+        with _record_function(self._trace_name):
             return x
 
 
