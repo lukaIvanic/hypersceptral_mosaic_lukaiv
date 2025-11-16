@@ -278,8 +278,11 @@ class Track1Dataset(Dataset):
 
         if cached_entry is not None:
             base_mosaic, base_cube, orig_shape = cached_entry
-            mosaic = base_mosaic.clone()
-            cube = base_cube.clone() if base_cube.numel() > 0 else base_cube
+            # Tensors retrieved from the RAM cache are treated as immutable by downstream
+            # augmentations/transforms, so we can hand out the cached references directly.
+            # This avoids per-sample clones (hundreds of MB) that were dominating I/O time.
+            mosaic = base_mosaic
+            cube = base_cube
             logger.debug("ram-cache-hit: %s split=%s", sample_id, self.split)
         else:
             if self.cache_dir is not None:
