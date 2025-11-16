@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 _PROCESS = psutil.Process() if psutil is not None else None
 
 
+def _log_partial_load(result: Any, context: str) -> None:
+    if result is None:
+        return
+    missing = getattr(result, "missing_keys", [])
+    unexpected = getattr(result, "unexpected_keys", [])
+    if missing:
+        logger.warning("[%s] Missing keys when loading state_dict: %s", context, missing)
+    if unexpected:
+        logger.warning("[%s] Unexpected keys when loading state_dict: %s", context, unexpected)
+
+
 class WarmupCosineScheduler:
     """
     Lightweight cosine scheduler with optional linear warmup.
@@ -477,6 +488,9 @@ def main(args: argparse.Namespace) -> None:
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
     ).to(device)
+    allow_partial_load = getattr(args, "allow_partial_load", False)
+    strict_checkpoint_load = not allow_partial_load
+
     init_from = getattr(args, "init_from", None)
     if init_from:
         ckpt_path = Path(init_from)
@@ -484,7 +498,9 @@ def main(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"--init-from checkpoint not found: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device)
         state_dict = checkpoint.get("model", checkpoint)
-        model.load_state_dict(state_dict, strict=True)
+        load_result = model.load_state_dict(state_dict, strict=strict_checkpoint_load)
+        if allow_partial_load:
+            _log_partial_load(load_result, "Init")
         logger.info("[Init] Loaded weights from %s", ckpt_path)
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -534,10 +550,22 @@ def main(args: argparse.Namespace) -> None:
             )
         else:
             checkpoint = torch.load(last_ckpt_path, map_location=device)
-            model.load_state_dict(checkpoint["model"])
+            load_result = model.load_state_dict(
+                checkpoint["model"], strict=strict_checkpoint_load
+            )
+            if allow_partial_load:
+                _log_partial_load(load_result, "Resume")
             optimizer_state = checkpoint.get("optimizer")
             if optimizer_state is not None:
-                optimizer.load_state_dict(optimizer_state)
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                except (ValueError, RuntimeError) as exc:
+                    if strict_checkpoint_load:
+                        raise
+                    logger.warning(
+                        "[Resume] Optimizer state mismatch (%s); starting with fresh optimizer state.",
+                        exc,
+                    )
             saved_epoch = int(checkpoint.get("epoch", last_ckpt_epoch))
             start_epoch = saved_epoch + 1
             logger.info(
@@ -874,6 +902,11 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to checkpoint (.pt) used to initialize model weights (no optimizer resume).",
+    )
+    parser.add_argument(
+        "--allow-partial-load",
+        action="store_true",
+        help="Allow checkpoint/model mismatches when loading (missing layers stay at init, optimizer state falls back to fresh).",
     )
     return parser
 
