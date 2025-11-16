@@ -49,6 +49,12 @@ class TrainConfig:
     val_interval: int = 1
     checkpoint_every: int = 1
 
+    # Optional profiling (torch.profiler)
+    profile_steps: int = 0
+    profile_epoch: int = 1
+    profile_dir: Path | None = None
+    profile_start_step: int = 1
+
     # Loss weights (Step 1A defaults)
     lambda_l1: float = 1.0
     lambda_sam: float = 0.1

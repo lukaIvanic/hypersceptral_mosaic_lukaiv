@@ -181,6 +181,9 @@ def train_one_epoch(
     log_interval: int,
     epoch: int,
     inference_resize: int | None,
+    profile_steps: int = 0,
+    profile_output_dir: Path | None = None,
+    profile_start_step: int = 1,
 ) -> Dict[str, float]:
     model.train()
     running_loss = 0.0
@@ -199,79 +202,145 @@ def train_one_epoch(
     }
     prev_time = time.perf_counter()
     use_cuda = device.type == "cuda"
-
-    for step, batch in enumerate(loader, start=1):
-        io_time = time.perf_counter() - prev_time
-
-        def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
-            return (
-                batch["input"].to(device, non_blocking=use_cuda),
-                batch["target"].to(device, non_blocking=use_cuda),
-            )
-
-        (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
-        batch_size = inputs.size(0)
-
-        optimizer.zero_grad(set_to_none=True)
-        final_shape = tuple(int(dim) for dim in targets.shape[-2:])
-        preds, forward_time = _time_block(
-            device, lambda: run_model_with_resize(model, inputs, inference_resize, final_shape)
-        )
-        interp_time = getattr(model, "last_interp_time", 0.0)
-
-        loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets))
-        _, backward_time = _time_block(device, lambda: loss.backward())
-        _, optimizer_time = _time_block(device, optimizer.step)
-        loss_item_start = time.perf_counter()
-        loss_value = float(loss.item())
-        loss_item_time = time.perf_counter() - loss_item_start
-
-        running_loss += loss_value * batch_size
-        num_samples += batch_size
-
-        timings["io"] += io_time
-        timings["preprocess"] += preprocess_time
-        timings["forward"] += forward_time
-        timings["loss_fn"] += loss_fn_time
-        timings["backward"] += backward_time
-        timings["optimizer"] += optimizer_time
-        timings["loss_item"] += loss_item_time
-        timings["interp"] += interp_time
-        if _PROCESS is not None:
-            ram_mb = _PROCESS.memory_info().rss / (1024 ** 2)
-            timings["ram_mb"] += ram_mb
+    profiler = None
+    remaining_profile_steps = max(0, profile_steps)
+    profile_ready = remaining_profile_steps > 0
+    trace_handler = None
+    torch_profile = None
+    ProfilerActivity = None
+    if profile_ready:
+        try:
+            from torch.profiler import ProfilerActivity as _ProfilerActivity
+            from torch.profiler import profile as _torch_profile
+            from torch.profiler import tensorboard_trace_handler
+        except (ImportError, RuntimeError) as exc:  # pragma: no cover - depends on torch build
+            logger.warning("[Profiler] torch.profiler unavailable (%s); disabling profiling.", exc)
+            profile_ready = False
         else:
-            ram_mb = None
+            ProfilerActivity = _ProfilerActivity
+            torch_profile = _torch_profile
+            if profile_output_dir is not None:
+                profile_output_dir.mkdir(parents=True, exist_ok=True)
+                trace_handler = tensorboard_trace_handler(str(profile_output_dir))
+            else:
+                trace_handler = None
 
-        logger.debug(
-            "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
-            "loss_fn=%.2f ms | backward=%.2f ms | optimizer=%.2f ms | loss_item=%.2f ms | "
-            "interp=%.2f ms%s",
+    def _maybe_start_profiler(current_step: int) -> None:
+        nonlocal profiler, profile_ready
+        if (
+            not profile_ready
+            or profiler is not None
+            or remaining_profile_steps <= 0
+            or current_step < max(1, profile_start_step)
+        ):
+            return
+        activities = [ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        profiler = torch_profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+            with_flops=False,
+            on_trace_ready=trace_handler,
+        )
+        profiler.__enter__()
+        logger.info(
+            "[Profiler] Capturing %d training step(s) starting at step %d of epoch %d%s",
+            remaining_profile_steps,
+            current_step,
             epoch,
-            step,
-            steps_total,
-            io_time * 1e3,
-            preprocess_time * 1e3,
-            forward_time * 1e3,
-            loss_fn_time * 1e3,
-            backward_time * 1e3,
-            optimizer_time * 1e3,
-            loss_item_time * 1e3,
-            interp_time * 1e3,
-            "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
+            "" if profile_output_dir is None else f" (traces -> {profile_output_dir})",
         )
 
-        if step % log_interval == 0:
-            avg_loss = running_loss / max(num_samples, 1)
-            logger.info(
-                "[Train] Epoch %d Step %d/%d | loss=%.4f",
+    try:
+        for step, batch in enumerate(loader, start=1):
+            _maybe_start_profiler(step)
+            io_time = time.perf_counter() - prev_time
+
+            def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
+                return (
+                    batch["input"].to(device, non_blocking=use_cuda),
+                    batch["target"].to(device, non_blocking=use_cuda),
+                )
+
+            (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
+            batch_size = inputs.size(0)
+
+            optimizer.zero_grad(set_to_none=True)
+            final_shape = tuple(int(dim) for dim in targets.shape[-2:])
+            preds, forward_time = _time_block(
+                device, lambda: run_model_with_resize(model, inputs, inference_resize, final_shape)
+            )
+            interp_time = getattr(model, "last_interp_time", 0.0)
+
+            loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets))
+            _, backward_time = _time_block(device, lambda: loss.backward())
+            _, optimizer_time = _time_block(device, optimizer.step)
+            loss_item_start = time.perf_counter()
+            loss_value = float(loss.item())
+            loss_item_time = time.perf_counter() - loss_item_start
+
+            running_loss += loss_value * batch_size
+            num_samples += batch_size
+
+            timings["io"] += io_time
+            timings["preprocess"] += preprocess_time
+            timings["forward"] += forward_time
+            timings["loss_fn"] += loss_fn_time
+            timings["backward"] += backward_time
+            timings["optimizer"] += optimizer_time
+            timings["loss_item"] += loss_item_time
+            timings["interp"] += interp_time
+            if _PROCESS is not None:
+                ram_mb = _PROCESS.memory_info().rss / (1024 ** 2)
+                timings["ram_mb"] += ram_mb
+            else:
+                ram_mb = None
+
+            logger.debug(
+                "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
+                "loss_fn=%.2f ms | backward=%.2f ms | optimizer=%.2f ms | loss_item=%.2f ms | "
+                "interp=%.2f ms%s",
                 epoch,
                 step,
                 steps_total,
-                avg_loss,
+                io_time * 1e3,
+                preprocess_time * 1e3,
+                forward_time * 1e3,
+                loss_fn_time * 1e3,
+                backward_time * 1e3,
+                optimizer_time * 1e3,
+                loss_item_time * 1e3,
+                interp_time * 1e3,
+                "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
             )
 
-        prev_time = time.perf_counter()
+            if step % log_interval == 0:
+                avg_loss = running_loss / max(num_samples, 1)
+                logger.info(
+                    "[Train] Epoch %d Step %d/%d | loss=%.4f",
+                    epoch,
+                    step,
+                    steps_total,
+                    avg_loss,
+                )
+
+            prev_time = time.perf_counter()
+
+            if profiler is not None:
+                profiler.step()
+                remaining_profile_steps -= 1
+                if remaining_profile_steps <= 0:
+                    profiler.__exit__(None, None, None)
+                    profiler = None
+                    profile_ready = False
+                    logger.info("[Profiler] Completed requested capture for epoch %d.", epoch)
+    finally:
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            profile_ready = False
 
     avg_times = {k: (v / max(steps_total, 1)) for k, v in timings.items()}
     avg_times["loss"] = running_loss / max(num_samples, 1)
@@ -404,6 +473,17 @@ def main(args: argparse.Namespace) -> None:
     if getattr(args, "scheduler_min_lr", None) is not None:
         cfg.scheduler_min_lr = args.scheduler_min_lr
 
+    # Profiling options
+    if getattr(args, "profile_steps", None) is not None:
+        cfg.profile_steps = max(0, int(args.profile_steps))
+    if getattr(args, "profile_epoch", None) is not None:
+        cfg.profile_epoch = max(1, int(args.profile_epoch))
+    if getattr(args, "profile_dir", None) is not None:
+        value = args.profile_dir.strip()
+        cfg.profile_dir = None if value == "" else Path(value)
+    if getattr(args, "profile_start_step", None) is not None:
+        cfg.profile_start_step = max(1, int(args.profile_start_step))
+
     # Data augmentation flags
     if getattr(args, "aug_rotate90", False):
         cfg.aug_rotate90 = True
@@ -443,6 +523,8 @@ def main(args: argparse.Namespace) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.profile_steps > 0 and cfg.profile_dir is None:
+        cfg.profile_dir = run_dir / "profiling"
 
     history_path = metrics_dir / "metrics.json"
     legacy_history_path = run_dir / "metrics.json"
@@ -629,6 +711,12 @@ def main(args: argparse.Namespace) -> None:
             current_lr = scheduler.step(epoch - 1)
         else:
             current_lr = optimizer.param_groups[0]["lr"]
+        epoch_profile_steps = 0
+        epoch_profile_dir: Path | None = None
+        if cfg.profile_steps > 0 and epoch == cfg.profile_epoch:
+            profile_root = cfg.profile_dir or (run_dir / "profiling")
+            epoch_profile_dir = profile_root / f"epoch_{epoch:03d}"
+            epoch_profile_steps = cfg.profile_steps
         train_stats = train_one_epoch(
             model,
             train_loader,
@@ -638,6 +726,9 @@ def main(args: argparse.Namespace) -> None:
             cfg.log_interval,
             epoch,
             cfg.train_inference_resize,
+            profile_steps=epoch_profile_steps,
+            profile_output_dir=epoch_profile_dir,
+            profile_start_step=cfg.profile_start_step,
         )
         train_stats["lr"] = current_lr
         logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
@@ -744,6 +835,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--hidden-channels", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=0,
+        help="Number of training steps to capture with torch.profiler (0 disables profiling).",
+    )
+    parser.add_argument(
+        "--profile-epoch",
+        type=int,
+        default=1,
+        help="Epoch index (1-based) in which profiling should run.",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=1,
+        help="First training step (1-based) within the profiling epoch to capture.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=None,
+        help="Directory to store profiler traces (defaults to run_dir/profiling).",
+    )
     parser.add_argument(
         "--resize-to",
         type=int,
