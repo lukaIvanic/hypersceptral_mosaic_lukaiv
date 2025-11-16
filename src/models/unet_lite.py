@@ -49,6 +49,16 @@ class RMSNorm2d(nn.Module):
             return x * rms * self.weight
 
 
+class IdentityNorm(nn.Module):
+    def __init__(self, tag: str | None = None) -> None:
+        super().__init__()
+        self._trace_name = tag or "identity_norm"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with _record_scope(self._trace_name):
+            return x
+
+
 def _make_norm_layer(channels: int, norm_type: str, tag: str | None = None) -> nn.Module:
     norm_type = norm_type.lower()
     groups = min(32, channels)
@@ -59,7 +69,9 @@ def _make_norm_layer(channels: int, norm_type: str, tag: str | None = None) -> n
         return _InstrumentedGroupNorm(groups, channels, trace_name)
     if norm_type == "rms":
         return RMSNorm2d(channels, tag=tag)
-    raise ValueError(f"Unknown norm_type '{norm_type}'. Supported: group, rms.")
+    if norm_type in {"none", "identity", "off"}:
+        return IdentityNorm(tag=tag or f"identity_norm/{next(_GN_COUNTER)}")
+    raise ValueError(f"Unknown norm_type '{norm_type}'. Supported: group, rms, none.")
 
 
 class ResidualBlock(nn.Module):

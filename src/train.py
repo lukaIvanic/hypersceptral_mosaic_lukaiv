@@ -967,8 +967,8 @@ def build_argparser() -> argparse.ArgumentParser:
         "--norm-type",
         type=str,
         default=None,
-        choices=["group", "rms"],
-        help="Normalization layer for UNet-lite (group, rms).",
+        choices=["group", "rms", "none"],
+        help="Normalization layer for UNet-lite (group, rms, none).",
     )
     parser.add_argument(
         "--lambda-l1",
