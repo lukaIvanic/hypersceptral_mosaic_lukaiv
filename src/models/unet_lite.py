@@ -311,8 +311,18 @@ class UNetLiteHSI(nn.Module):
             residual_in = latent_channels + out_channels
             residual_hidden = max(latent_channels, out_channels)
             self.residual_head = nn.Sequential(
-                ResidualBlock(residual_in, residual_hidden, kernel_size=self.conv_kernel_size),
-                ResidualBlock(residual_hidden, residual_hidden, kernel_size=self.conv_kernel_size),
+                ResidualBlock(
+                    residual_in,
+                    residual_hidden,
+                    kernel_size=self.conv_kernel_size,
+                    norm_factory=norm_factory,
+                ),
+                ResidualBlock(
+                    residual_hidden,
+                    residual_hidden,
+                    kernel_size=self.conv_kernel_size,
+                    norm_factory=norm_factory,
+                ),
                 nn.Conv2d(residual_hidden, out_channels, kernel_size=1),
             )
         else:
