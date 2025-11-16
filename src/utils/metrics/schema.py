@@ -14,6 +14,7 @@ TRAINING_METRIC_UNITS: Dict[str, str] = {
     "optimizer": "s",
     "loss_item": "s",
     "interp": "s",
+    "step_wall": "s",
     "ram_mb": "MB",
     "lr": "1",
 }
@@ -44,6 +45,7 @@ SPEED_METRICS = frozenset(
         "optimizer",
         "loss_item",
         "interp",
+        "step_wall",
         "ram_mb",
     }
 )
@@ -123,6 +125,7 @@ METRIC_DISPLAY_NAMES: Dict[str, str] = {
     "optimizer": "Optimizer Step",
     "loss_item": "Loss Sync",
     "interp": "Interpolation",
+    "step_wall": "Step Wall Time",
     "ram_mb": "RAM (avg)",
 }
 

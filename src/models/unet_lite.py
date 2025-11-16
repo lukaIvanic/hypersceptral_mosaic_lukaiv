@@ -1,21 +1,45 @@
 from __future__ import annotations
 
 import time
+import itertools
 from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:  # pragma: no cover - record_function optional
+    from torch.profiler import record_function as _record_function
+except (ImportError, RuntimeError):
+    _record_function = None
 
-def _make_group_norm(channels: int) -> nn.GroupNorm:
+
+class _InstrumentedGroupNorm(nn.GroupNorm):
+    def __init__(self, num_groups: int, num_channels: int, trace_name: str) -> None:
+        super().__init__(num_groups, num_channels)
+        self._trace_name = trace_name
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if _record_function is None:
+            return super().forward(input)
+        with _record_function(self._trace_name):
+            return super().forward(input)
+
+
+_GN_COUNTER = itertools.count()
+
+
+def _make_group_norm(channels: int, tag: str | None = None) -> nn.GroupNorm:
     groups = min(32, channels)
     while groups > 1 and channels % groups != 0:
         groups -= 1
-    return nn.GroupNorm(groups, channels)
+    trace_name = tag or f"group_norm/{next(_GN_COUNTER)}"
+    return _InstrumentedGroupNorm(groups, channels, trace_name)
 
 
 class ResidualBlock(nn.Module):
+    _instance_counter = itertools.count()
+
     def __init__(
         self,
         in_channels: int,
@@ -27,10 +51,11 @@ class ResidualBlock(nn.Module):
         super().__init__()
         padding = kernel_size // 2
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
-        self.norm1 = _make_group_norm(out_channels)
+        self._instance_id = next(ResidualBlock._instance_counter)
+        self.norm1 = _make_group_norm(out_channels, tag=f"resblock/{self._instance_id}/norm1")
         self.act = nn.GELU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=padding)
-        self.norm2 = _make_group_norm(out_channels)
+        self.norm2 = _make_group_norm(out_channels, tag=f"resblock/{self._instance_id}/norm2")
         if in_channels == out_channels:
             self.proj: nn.Module = nn.Identity()
         else:
@@ -171,7 +196,7 @@ class UNetLiteHSI(nn.Module):
 
         self.stem = nn.Sequential(
             nn.Conv2d(stem_channels, base_channels, kernel_size=3, padding=1),
-            _make_group_norm(base_channels),
+            _make_group_norm(base_channels, tag="stem/norm"),
             nn.GELU(),
         )
 
@@ -215,7 +240,7 @@ class UNetLiteHSI(nn.Module):
         )
         latent_unshuffle_channels = latent_channels * (pixel_factor**2)
         self.latent_proj = nn.Conv2d(channel_progression[0], latent_unshuffle_channels, kernel_size=1)
-        self.latent_norm = _make_group_norm(latent_channels)
+        self.latent_norm = _make_group_norm(latent_channels, tag="latent/norm")
         self.coarse_head = nn.Conv2d(latent_channels, coarse_channels, kernel_size=1)
 
         # Optional coarse + residual refinement head

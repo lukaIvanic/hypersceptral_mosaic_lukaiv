@@ -485,7 +485,7 @@ def create_dataloaders(
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        pin_memory=cfg.device.startswith("cuda"),
+        pin_memory=True,
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
@@ -494,7 +494,7 @@ def create_dataloaders(
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        pin_memory=cfg.device.startswith("cuda"),
+        pin_memory=True,
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )

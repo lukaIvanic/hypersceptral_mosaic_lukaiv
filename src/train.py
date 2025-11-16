@@ -198,10 +198,10 @@ def train_one_epoch(
         "optimizer": 0.0,
         "loss_item": 0.0,
         "interp": 0.0,
+        "step_wall": 0.0,
         "ram_mb": 0.0,
     }
     prev_time = time.perf_counter()
-    use_cuda = device.type == "cuda"
     profiler = None
     remaining_profile_steps = max(0, profile_steps)
     profile_ready = remaining_profile_steps > 0
@@ -256,14 +256,15 @@ def train_one_epoch(
 
     try:
         for step, batch in enumerate(loader, start=1):
+            step_start_time = prev_time
             _maybe_start_profiler(step)
             io_time = time.perf_counter() - prev_time
 
-            def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
-                return (
-                    batch["input"].to(device, non_blocking=use_cuda),
-                    batch["target"].to(device, non_blocking=use_cuda),
-                )
+        def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                batch["input"].to(device, non_blocking=True),
+                batch["target"].to(device, non_blocking=True),
+            )
 
             (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
             batch_size = inputs.size(0)
@@ -299,10 +300,14 @@ def train_one_epoch(
             else:
                 ram_mb = None
 
+            step_end_time = time.perf_counter()
+            timings["step_wall"] += step_end_time - step_start_time
+            prev_time = step_end_time
+
             logger.debug(
                 "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
                 "loss_fn=%.2f ms | backward=%.2f ms | optimizer=%.2f ms | loss_item=%.2f ms | "
-                "interp=%.2f ms%s",
+                "interp=%.2f ms | wall=%.2f ms%s",
                 epoch,
                 step,
                 steps_total,
@@ -314,6 +319,7 @@ def train_one_epoch(
                 optimizer_time * 1e3,
                 loss_item_time * 1e3,
                 interp_time * 1e3,
+                (step_end_time - step_start_time) * 1e3,
                 "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
             )
 
@@ -326,8 +332,6 @@ def train_one_epoch(
                     steps_total,
                     avg_loss,
                 )
-
-            prev_time = time.perf_counter()
 
             if profiler is not None:
                 profiler.step()
@@ -483,6 +487,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.profile_dir = None if value == "" else Path(value)
     if getattr(args, "profile_start_step", None) is not None:
         cfg.profile_start_step = max(1, int(args.profile_start_step))
+    if getattr(args, "use_compile", False):
+        cfg.use_compile = True
 
     # Data augmentation flags
     if getattr(args, "aug_rotate90", False):
@@ -608,6 +614,15 @@ def main(args: argparse.Namespace) -> None:
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
     ).to(device)
+    if cfg.use_compile:
+        if hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("[torch.compile] Enabled (mode=reduce-overhead).")
+            except Exception as exc:  # pragma: no cover - depends on torch version
+                logger.warning("[torch.compile] Failed (%s); continuing without.", exc)
+        else:
+            logger.warning("[torch.compile] Requested but torch.compile is unavailable in this PyTorch build.")
     allow_partial_load = getattr(args, "allow_partial_load", False)
     strict_checkpoint_load = not allow_partial_load
 
@@ -734,7 +749,7 @@ def main(args: argparse.Namespace) -> None:
         logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
         msg = (
             "Epoch %d timing (ms): io=%.2f | preprocess=%.2f | forward=%.2f | "
-            "loss_fn=%.2f | backward=%.2f | optimizer=%.2f | loss_item=%.2f | interp=%.2f"
+            "loss_fn=%.2f | backward=%.2f | optimizer=%.2f | loss_item=%.2f | interp=%.2f | wall=%.2f"
         )
         args = [
             epoch,
@@ -746,6 +761,7 @@ def main(args: argparse.Namespace) -> None:
             train_stats["optimizer"] * 1e3,
             train_stats["loss_item"] * 1e3,
             train_stats["interp"] * 1e3,
+            train_stats["step_wall"] * 1e3,
         ]
         if _PROCESS is not None and train_stats.get("ram_mb") is not None:
             msg += " | ram=%.1f MB"
@@ -852,6 +868,11 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="First training step (1-based) within the profiling epoch to capture.",
+    )
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        help="Enable torch.compile (requires PyTorch 2.0+).",
     )
     parser.add_argument(
         "--profile-dir",

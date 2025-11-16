@@ -55,6 +55,9 @@ class TrainConfig:
     profile_dir: Path | None = None
     profile_start_step: int = 1
 
+    # Optional PyTorch 2.x compilation (torch.compile)
+    use_compile: bool = False
+
     # Loss weights (Step 1A defaults)
     lambda_l1: float = 1.0
     lambda_sam: float = 0.1
