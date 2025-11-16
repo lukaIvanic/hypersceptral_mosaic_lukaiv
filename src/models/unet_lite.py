@@ -307,15 +307,21 @@ class UNetLiteHSI(nn.Module):
         latent = self.activation(latent)
 
         coarse = self.coarse_head(latent)
-        coarse = coarse.permute(0, 2, 3, 1).contiguous()
-        upsampled = F.interpolate(
-            coarse.view(-1, 1, self.coarse_channels),
-            size=self.out_channels,
-            mode="linear",
-            align_corners=True,
-        )
-        upsampled = upsampled.view(-1, coarse.shape[1], coarse.shape[2], self.out_channels)
-        spectral = upsampled.permute(0, 3, 1, 2).contiguous()
+        if self.coarse_channels == self.out_channels:
+            spectral = coarse
+            interp_time = 0.0
+        else:
+            start_interp = time.perf_counter()
+            coarse_hw = coarse.permute(0, 2, 3, 1).contiguous()
+            upsampled = F.interpolate(
+                coarse_hw.view(-1, 1, self.coarse_channels),
+                size=self.out_channels,
+                mode="linear",
+                align_corners=True,
+            )
+            upsampled = upsampled.view(-1, coarse_hw.shape[1], coarse_hw.shape[2], self.out_channels)
+            spectral = upsampled.permute(0, 3, 1, 2).contiguous()
+            interp_time = time.perf_counter() - start_interp
 
         # Optional residual refinement using decoder features
         if self.residual_head is not None:
@@ -331,7 +337,7 @@ class UNetLiteHSI(nn.Module):
             spectral = spectral_flat.view(b, c, h, w)
 
         output = torch.sigmoid(spectral)
-        self.last_interp_time = 0.0
+        self.last_interp_time = interp_time
         return output
 
     def predict_full_resolution(
