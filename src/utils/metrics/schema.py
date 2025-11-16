@@ -9,7 +9,10 @@ TRAINING_METRIC_UNITS: Dict[str, str] = {
     "io": "s",
     "preprocess": "s",
     "forward": "s",
+    "loss_fn": "s",
     "backward": "s",
+    "optimizer": "s",
+    "loss_item": "s",
     "interp": "s",
     "ram_mb": "MB",
     "lr": "1",
@@ -31,7 +34,19 @@ ACCURACY_METRIC_UNITS: Dict[str, str] = {
 
 # Metric groupings --------------------------------------------------------- #
 
-SPEED_METRICS = frozenset({"io", "preprocess", "forward", "backward", "interp", "ram_mb"})
+SPEED_METRICS = frozenset(
+    {
+        "io",
+        "preprocess",
+        "forward",
+        "loss_fn",
+        "backward",
+        "optimizer",
+        "loss_item",
+        "interp",
+        "ram_mb",
+    }
+)
 ACCURACY_METRICS = frozenset(
     {
         "loss",
@@ -103,7 +118,10 @@ METRIC_DISPLAY_NAMES: Dict[str, str] = {
     "io": "I/O Latency",
     "preprocess": "Preprocess Latency",
     "forward": "Forward Pass",
+    "loss_fn": "Loss Eval",
     "backward": "Backward Pass",
+    "optimizer": "Optimizer Step",
+    "loss_item": "Loss Sync",
     "interp": "Interpolation",
     "ram_mb": "RAM (avg)",
 }

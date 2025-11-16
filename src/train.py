@@ -5,7 +5,7 @@ import logging
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -53,6 +53,28 @@ def _log_partial_load(result: Any, context: str) -> None:
         logger.warning("[%s] Missing keys when loading state_dict: %s", context, missing)
     if unexpected:
         logger.warning("[%s] Unexpected keys when loading state_dict: %s", context, unexpected)
+
+
+def _time_block(device: torch.device, fn: Callable[[], Any]) -> tuple[Any, float]:
+    """
+    Measure the wall-time of ``fn`` with CUDA-aware synchronization.
+    Returns (result, seconds).
+    """
+
+    if device.type == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        result = fn()
+        end_event.record()
+        torch.cuda.synchronize(device)
+        duration = start_event.elapsed_time(end_event) / 1000.0
+        return result, duration
+
+    start = time.perf_counter()
+    result = fn()
+    duration = time.perf_counter() - start
+    return result, duration
 
 
 class WarmupCosineScheduler:
@@ -168,46 +190,52 @@ def train_one_epoch(
         "io": 0.0,
         "preprocess": 0.0,
         "forward": 0.0,
+        "loss_fn": 0.0,
         "backward": 0.0,
+        "optimizer": 0.0,
+        "loss_item": 0.0,
         "interp": 0.0,
         "ram_mb": 0.0,
     }
     prev_time = time.perf_counter()
+    use_cuda = device.type == "cuda"
 
     for step, batch in enumerate(loader, start=1):
         io_time = time.perf_counter() - prev_time
-        preprocess_start = time.perf_counter()
-        inputs = batch["input"].to(device)
-        targets = batch["target"].to(device)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        preprocess_time = time.perf_counter() - preprocess_start
+
+        def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                batch["input"].to(device, non_blocking=use_cuda),
+                batch["target"].to(device, non_blocking=use_cuda),
+            )
+
+        (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
         batch_size = inputs.size(0)
 
         optimizer.zero_grad(set_to_none=True)
-        forward_start = time.perf_counter()
         final_shape = tuple(int(dim) for dim in targets.shape[-2:])
-        preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        forward_time = time.perf_counter() - forward_start
+        preds, forward_time = _time_block(
+            device, lambda: run_model_with_resize(model, inputs, inference_resize, final_shape)
+        )
         interp_time = getattr(model, "last_interp_time", 0.0)
 
-        backward_start = time.perf_counter()
-        loss = loss_fn(preds, targets)
-        loss.backward()
-        optimizer.step()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        backward_time = time.perf_counter() - backward_start
+        loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets))
+        _, backward_time = _time_block(device, lambda: loss.backward())
+        _, optimizer_time = _time_block(device, optimizer.step)
+        loss_item_start = time.perf_counter()
+        loss_value = float(loss.item())
+        loss_item_time = time.perf_counter() - loss_item_start
 
-        running_loss += loss.item() * batch_size
+        running_loss += loss_value * batch_size
         num_samples += batch_size
 
         timings["io"] += io_time
         timings["preprocess"] += preprocess_time
         timings["forward"] += forward_time
+        timings["loss_fn"] += loss_fn_time
         timings["backward"] += backward_time
+        timings["optimizer"] += optimizer_time
+        timings["loss_item"] += loss_item_time
         timings["interp"] += interp_time
         if _PROCESS is not None:
             ram_mb = _PROCESS.memory_info().rss / (1024 ** 2)
@@ -217,14 +245,18 @@ def train_one_epoch(
 
         logger.debug(
             "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
-            "backward=%.2f ms | interp=%.2f ms%s",
+            "loss_fn=%.2f ms | backward=%.2f ms | optimizer=%.2f ms | loss_item=%.2f ms | "
+            "interp=%.2f ms%s",
             epoch,
             step,
             steps_total,
             io_time * 1e3,
             preprocess_time * 1e3,
             forward_time * 1e3,
+            loss_fn_time * 1e3,
             backward_time * 1e3,
+            optimizer_time * 1e3,
+            loss_item_time * 1e3,
             interp_time * 1e3,
             "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
         )
@@ -611,14 +643,17 @@ def main(args: argparse.Namespace) -> None:
         logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
         msg = (
             "Epoch %d timing (ms): io=%.2f | preprocess=%.2f | forward=%.2f | "
-            "backward=%.2f | interp=%.2f"
+            "loss_fn=%.2f | backward=%.2f | optimizer=%.2f | loss_item=%.2f | interp=%.2f"
         )
         args = [
             epoch,
             train_stats["io"] * 1e3,
             train_stats["preprocess"] * 1e3,
             train_stats["forward"] * 1e3,
+            train_stats["loss_fn"] * 1e3,
             train_stats["backward"] * 1e3,
+            train_stats["optimizer"] * 1e3,
+            train_stats["loss_item"] * 1e3,
             train_stats["interp"] * 1e3,
         ]
         if _PROCESS is not None and train_stats.get("ram_mb") is not None:
