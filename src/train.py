@@ -260,11 +260,11 @@ def train_one_epoch(
             _maybe_start_profiler(step)
             io_time = time.perf_counter() - prev_time
 
-        def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
-            return (
-                batch["input"].to(device, non_blocking=True),
-                batch["target"].to(device, non_blocking=True),
-            )
+            def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
+                return (
+                    batch["input"].to(device, non_blocking=True),
+                    batch["target"].to(device, non_blocking=True),
+                )
 
             (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
             batch_size = inputs.size(0)
