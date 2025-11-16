@@ -17,8 +17,8 @@ from src.evaluate import load_model, run_model_with_resize
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run inference on validation samples and generate per-pixel MAE heatmaps. "
-            "Requires ground-truth availability (validation/public test split)."
+            "Run inference on validation or training samples and generate per-pixel MAE heatmaps. "
+            "Requires ground-truth availability (validation/public test split or training split)."
         )
     )
     parser.add_argument(
@@ -111,6 +111,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Explicit list of sample ids to process (e.g., Category-1_a_0008 Category-1_a_0022).",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="val",
+        choices=("train", "val", "validation"),
+        help="Dataset split to visualize. 'val'/'validation' uses the test-public validation split; 'train' uses the training split.",
     )
     parser.add_argument(
         "--output-dir",
@@ -220,7 +227,8 @@ def _subset_dataset(
         available = {sid: idx for idx, sid in enumerate(dataset.ids)}
         missing = sorted({sid for sid in sample_ids if sid not in available})
         if missing:
-            raise ValueError(f"Requested sample ids not found in validation split: {missing}")
+            split_name = getattr(dataset, "split", "dataset")
+            raise ValueError(f"Requested sample ids not found in {split_name} split: {missing}")
         ordered_indices = [available[sid] for sid in sample_ids]
         selected_ids = list(sample_ids)
     else:
@@ -238,6 +246,29 @@ def _subset_dataset(
 
 def _format_size(tensor: torch.Tensor) -> str:
     return "x".join(str(dim) for dim in tensor.shape)
+
+
+def _normalize_split_name(split: Optional[str]) -> str:
+    if not split:
+        return "val"
+    split_lower = split.lower()
+    if split_lower == "validation":
+        return "val"
+    return split_lower
+
+
+def _format_output_id(sample_id: str, split: str) -> str:
+    normalized = _normalize_split_name(split)
+    if normalized == "val":
+        return sample_id
+    return f"{normalized}__{sample_id}"
+
+
+def _format_display_id(sample_id: str, split: str) -> str:
+    normalized = _normalize_split_name(split)
+    if normalized == "val":
+        return sample_id
+    return f"{sample_id} [{normalized}]"
 
 
 @torch.no_grad()
@@ -287,6 +318,10 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
     output_dir: Path = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    dataset_split = _normalize_split_name(getattr(args, "split", "val"))
+    if dataset_split not in {"train", "val"}:
+        raise ValueError("Heatmap visualization supports only 'train' and 'val' splits.")
+
     model_runs_root = Path(__file__).resolve().parent.parent / "src" / "models" / "simple_cnn" / "runs"
     checkpoint_path = _resolve_checkpoint(args, model_runs_root)
     strict = not args.allow_partial
@@ -305,13 +340,15 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
 
     dataset = Track1Dataset(
         root=cfg.data_root,
-        split="val",
+        split=dataset_split,
         resize_to=dataset_resize,
         cache_dir=cfg.cache_dir,
         write_cache=cfg.write_cache,
     )
     if not getattr(dataset, "targets_available", False):
-        raise RuntimeError("Validation split ground truth is unavailable. Heatmap inspection requires GT cubes.")
+        raise RuntimeError(
+            f"Ground truth is unavailable for split '{dataset_split}'. Heatmap inspection requires GT cubes."
+        )
 
     subset_dataset, selected_ids = _subset_dataset(dataset, args.sample_ids, args.sample_limit)
 
@@ -332,8 +369,8 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
 
     resize_label = dataset_resize if dataset_resize is not None else "native"
     print(
-        f"[Heatmap] Selected {len(selected_ids)} sample(s) | dataset_resize={resize_label} | "
-        f"batch_size={loader_kwargs['batch_size']}"
+        f"[Heatmap] Selected {len(selected_ids)} sample(s) from split='{dataset_split}' | "
+        f"dataset_resize={resize_label} | batch_size={loader_kwargs['batch_size']}"
     )
 
     percentile = args.percentile
@@ -386,11 +423,13 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
             mae_map = mae_maps[offset].detach().cpu().numpy()
             sample_mean = float(mae_map.mean())
             sample_max = float(mae_map.max())
+            display_id = _format_display_id(sample_id, dataset_split)
+            output_id = _format_output_id(sample_id, dataset_split)
 
             total_pixel_sum += float(mae_map.sum())
             total_pixel_count += int(mae_map.size)
             global_max = max(global_max, sample_max)
-            per_sample_means.append((sample_id, sample_mean))
+            per_sample_means.append((display_id, sample_mean))
             processed += 1
 
             if args.vmax is not None:
@@ -407,13 +446,13 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
 
             fig, ax = plt.subplots(figsize=tuple(args.figsize))
             im = ax.imshow(mae_map, cmap=cmap, vmin=0.0, vmax=vmax)
-            ax.set_title(f"{sample_id} | mean={sample_mean:.5f} | max={sample_max:.5f}")
+            ax.set_title(f"{display_id} | mean={sample_mean:.5f} | max={sample_max:.5f}")
             ax.set_axis_off()
             if not args.no_colorbar:
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Per-pixel MAE")
             fig.tight_layout()
 
-            png_path = output_dir / f"{sample_id}_pixel_mae.png"
+            png_path = output_dir / f"{output_id}_pixel_mae.png"
             if png_path.exists() and not args.overwrite:
                 print(f"[Heatmap] Skipping existing file (use --overwrite): {png_path.name}")
             else:
@@ -421,7 +460,7 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
                 print(f"[Heatmap] Saved heatmap -> {png_path}")
             plt.close(fig)
 
-            band_dir = output_dir / sample_id / "bands"
+            band_dir = output_dir / output_id / "bands"
             band_dir.mkdir(parents=True, exist_ok=True)
             band_maps = diff[offset].detach().cpu().numpy()
             for band_idx in range(band_maps.shape[0]):
@@ -445,7 +484,7 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
                 fig_band, ax_band = plt.subplots(figsize=tuple(args.figsize))
                 im_band = ax_band.imshow(band_map, cmap=cmap, vmin=0.0, vmax=band_vmax)
                 ax_band.set_title(
-                    f"{sample_id} | band={band_idx + 1:02d} | mean={band_map.mean():.5f}"
+                    f"{display_id} | band={band_idx + 1:02d} | mean={band_map.mean():.5f}"
                 )
                 ax_band.set_axis_off()
                 if not args.no_colorbar:
@@ -471,7 +510,7 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
                         np.save(band_npy, band_map.astype(np.float32))
 
             if args.save_npy:
-                npy_path = output_dir / f"{sample_id}_pixel_mae.npy"
+                npy_path = output_dir / f"{output_id}_pixel_mae.npy"
                 if npy_path.exists() and not args.overwrite:
                     print(f"[Heatmap] Skipping existing .npy (use --overwrite): {npy_path.name}")
                 else:
@@ -494,7 +533,7 @@ def generate_heatmaps(args: argparse.Namespace) -> None:
     )
     overall_mean = total_pixel_sum / max(total_pixel_count, 1)
     print(
-        f"[Heatmap] Summary :: samples={processed} ({dataset_info}) | "
+        f"[Heatmap] Summary :: split={dataset_split} | samples={processed} ({dataset_info}) | "
         f"overall_mean_mae={overall_mean:.6f} | global_max={global_max:.6f}"
     )
     per_sample_means.sort(key=lambda item: item[1], reverse=True)
