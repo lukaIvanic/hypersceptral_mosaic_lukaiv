@@ -26,6 +26,7 @@ def create_model(
     stochastic_depth_p: float,
     use_bottleneck_attention: bool,
     conv_kernel_size: int,
+    norm_type: str,
 ) -> nn.Module:
     variant_norm = variant.lower()
     if variant_norm == "baseline":
@@ -52,6 +53,7 @@ def create_model(
             stochastic_depth_p=stochastic_depth_p,
             use_bottleneck_attention=use_bottleneck_attention,
             conv_kernel_size=conv_kernel_size,
+            norm_type=norm_type,
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite.")
 

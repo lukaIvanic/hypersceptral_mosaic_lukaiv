@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 import itertools
-from typing import List, Tuple
+from contextlib import nullcontext
+from typing import Callable, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,27 +15,51 @@ except (ImportError, RuntimeError):
     _record_function = None
 
 
+def _record_scope(name: str):
+    if _record_function is None:
+        return nullcontext()
+    return _record_function(name)
+
+
 class _InstrumentedGroupNorm(nn.GroupNorm):
     def __init__(self, num_groups: int, num_channels: int, trace_name: str) -> None:
         super().__init__(num_groups, num_channels)
         self._trace_name = trace_name
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if _record_function is None:
-            return super().forward(input)
-        with _record_function(self._trace_name):
+        with _record_scope(self._trace_name):
             return super().forward(input)
 
 
 _GN_COUNTER = itertools.count()
 
 
-def _make_group_norm(channels: int, tag: str | None = None) -> nn.GroupNorm:
+class RMSNorm2d(nn.Module):
+    _instance_counter = itertools.count()
+
+    def __init__(self, channels: int, eps: float = 1e-6, tag: str | None = None) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self._trace_name = tag or f"rms_norm/{next(RMSNorm2d._instance_counter)}"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with _record_scope(self._trace_name):
+            rms = torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + self.eps)
+            return x * rms * self.weight
+
+
+def _make_norm_layer(channels: int, norm_type: str, tag: str | None = None) -> nn.Module:
+    norm_type = norm_type.lower()
     groups = min(32, channels)
     while groups > 1 and channels % groups != 0:
         groups -= 1
-    trace_name = tag or f"group_norm/{next(_GN_COUNTER)}"
-    return _InstrumentedGroupNorm(groups, channels, trace_name)
+    if norm_type == "group":
+        trace_name = tag or f"group_norm/{next(_GN_COUNTER)}"
+        return _InstrumentedGroupNorm(groups, channels, trace_name)
+    if norm_type == "rms":
+        return RMSNorm2d(channels, tag=tag)
+    raise ValueError(f"Unknown norm_type '{norm_type}'. Supported: group, rms.")
 
 
 class ResidualBlock(nn.Module):
@@ -47,15 +72,17 @@ class ResidualBlock(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.0,
         stochastic_depth: float = 0.0,
+        norm_factory: Callable[[int, str | None], nn.Module] | None = None,
     ) -> None:
         super().__init__()
         padding = kernel_size // 2
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
         self._instance_id = next(ResidualBlock._instance_counter)
-        self.norm1 = _make_group_norm(out_channels, tag=f"resblock/{self._instance_id}/norm1")
+        factory = norm_factory or (lambda c, tag=None: _make_norm_layer(c, "group", tag))
+        self.norm1 = factory(out_channels, tag=f"resblock/{self._instance_id}/norm1")
         self.act = nn.GELU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=padding)
-        self.norm2 = _make_group_norm(out_channels, tag=f"resblock/{self._instance_id}/norm2")
+        self.norm2 = factory(out_channels, tag=f"resblock/{self._instance_id}/norm2")
         if in_channels == out_channels:
             self.proj: nn.Module = nn.Identity()
         else:
@@ -91,9 +118,15 @@ class DownBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_size: int = 3,
+        norm_factory: Callable[[int, str | None], nn.Module] | None = None,
     ) -> None:
         super().__init__()
-        self.pre = ResidualBlock(in_channels, out_channels, kernel_size=kernel_size)
+        self.pre = ResidualBlock(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            norm_factory=norm_factory,
+        )
         self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -112,6 +145,7 @@ class UpBlock(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.0,
         stochastic_depth: float = 0.0,
+        norm_factory: Callable[[int, str | None], nn.Module] | None = None,
     ) -> None:
         super().__init__()
         self.block = ResidualBlock(
@@ -120,6 +154,7 @@ class UpBlock(nn.Module):
             kernel_size=kernel_size,
             dropout=dropout,
             stochastic_depth=stochastic_depth,
+            norm_factory=norm_factory,
         )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -163,6 +198,7 @@ class UNetLiteHSI(nn.Module):
         stochastic_depth_p: float = 0.0,
         use_bottleneck_attention: bool = False,
         conv_kernel_size: int = 3,
+        norm_type: str = "group",
     ) -> None:
         super().__init__()
         if encoder_depth < 1:
@@ -179,6 +215,7 @@ class UNetLiteHSI(nn.Module):
         self.latent_channels = latent_channels
         self.encoder_depth = encoder_depth
         self.last_interp_time: float = 0.0
+        self.norm_type = norm_type.lower()
 
         self.use_residual_head = bool(use_residual_head)
         self.use_spectral_conv = bool(use_spectral_conv)
@@ -194,9 +231,11 @@ class UNetLiteHSI(nn.Module):
         for mult in _channel_multipliers(encoder_depth):
             channel_progression.append(base_channels * mult)
 
+        norm_factory = lambda c, tag=None: _make_norm_layer(c, self.norm_type, tag)
+
         self.stem = nn.Sequential(
             nn.Conv2d(stem_channels, base_channels, kernel_size=3, padding=1),
-            _make_group_norm(base_channels, tag="stem/norm"),
+            norm_factory(base_channels, tag="stem/norm"),
             nn.GELU(),
         )
 
@@ -204,7 +243,14 @@ class UNetLiteHSI(nn.Module):
         for idx in range(encoder_depth):
             in_ch = channel_progression[idx]
             out_ch = channel_progression[idx + 1]
-            self.down_blocks.append(DownBlock(in_ch, out_ch, kernel_size=self.conv_kernel_size))
+            self.down_blocks.append(
+                DownBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size=self.conv_kernel_size,
+                    norm_factory=norm_factory,
+                )
+            )
 
         bottleneck_channels = channel_progression[-1]
         self.bottleneck = ResidualBlock(
@@ -213,6 +259,7 @@ class UNetLiteHSI(nn.Module):
             kernel_size=self.conv_kernel_size,
             dropout=self.decoder_dropout,
             stochastic_depth=self.stochastic_depth_p,
+            norm_factory=norm_factory,
         )
 
         skip_channels = channel_progression[1:]
@@ -229,6 +276,7 @@ class UNetLiteHSI(nn.Module):
                     kernel_size=self.conv_kernel_size,
                     dropout=self.decoder_dropout,
                     stochastic_depth=self.stochastic_depth_p,
+                    norm_factory=norm_factory,
                 )
             )
             current_channels = out_ch
@@ -237,10 +285,11 @@ class UNetLiteHSI(nn.Module):
             current_channels + channel_progression[0],
             channel_progression[0],
             kernel_size=self.conv_kernel_size,
+            norm_factory=norm_factory,
         )
         latent_unshuffle_channels = latent_channels * (pixel_factor**2)
         self.latent_proj = nn.Conv2d(channel_progression[0], latent_unshuffle_channels, kernel_size=1)
-        self.latent_norm = _make_group_norm(latent_channels, tag="latent/norm")
+        self.latent_norm = norm_factory(latent_channels, tag="latent/norm")
         self.coarse_head = nn.Conv2d(latent_channels, coarse_channels, kernel_size=1)
 
         # Optional coarse + residual refinement head

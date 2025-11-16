@@ -89,6 +89,7 @@ class TrainConfig:
     spectral_conv_kernel_size: int = 3
     use_bottleneck_attention: bool = False
     conv_kernel_size: int = 3
+    norm_type: str = "group"
 
     # Regularization
     decoder_dropout: float = 0.0

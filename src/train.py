@@ -260,11 +260,13 @@ def train_one_epoch(
             _maybe_start_profiler(step)
             io_time = time.perf_counter() - prev_time
 
-            move_fn = lambda: (
+        def _move_to_device() -> tuple[torch.Tensor, torch.Tensor]:
+            return (
                 batch["input"].to(device, non_blocking=True),
                 batch["target"].to(device, non_blocking=True),
             )
-            (inputs, targets), preprocess_time = _time_block(device, move_fn)
+
+            (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
             batch_size = inputs.size(0)
 
             optimizer.zero_grad(set_to_none=True)
@@ -507,6 +509,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.use_bottleneck_attention = True
     if getattr(args, "conv_kernel_size", None) is not None:
         cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
+    if getattr(args, "norm_type", None) is not None:
+        cfg.norm_type = args.norm_type.lower()
 
     # Regularization options
     if getattr(args, "decoder_dropout", None) is not None:
@@ -611,6 +615,7 @@ def main(args: argparse.Namespace) -> None:
         stochastic_depth_p=cfg.stochastic_depth_p,
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
+        norm_type=cfg.norm_type,
     ).to(device)
     if cfg.use_compile:
         if hasattr(torch, "compile"):
@@ -957,6 +962,13 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of coarse spectral channels before interpolation (default from config).",
+    )
+    parser.add_argument(
+        "--norm-type",
+        type=str,
+        default=None,
+        choices=["group", "rms"],
+        help="Normalization layer for UNet-lite (group, rms).",
     )
     parser.add_argument(
         "--lambda-l1",
