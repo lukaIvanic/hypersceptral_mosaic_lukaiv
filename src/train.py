@@ -179,6 +179,8 @@ def train_one_epoch(
         preprocess_start = time.perf_counter()
         inputs = batch["input"].to(device)
         targets = batch["target"].to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         preprocess_time = time.perf_counter() - preprocess_start
         batch_size = inputs.size(0)
 
@@ -186,6 +188,8 @@ def train_one_epoch(
         forward_start = time.perf_counter()
         final_shape = tuple(int(dim) for dim in targets.shape[-2:])
         preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         forward_time = time.perf_counter() - forward_start
         interp_time = getattr(model, "last_interp_time", 0.0)
 
@@ -193,6 +197,8 @@ def train_one_epoch(
         loss = loss_fn(preds, targets)
         loss.backward()
         optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         backward_time = time.perf_counter() - backward_start
 
         running_loss += loss.item() * batch_size
