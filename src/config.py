@@ -58,6 +58,7 @@ class TrainConfig:
 
     # Optional PyTorch 2.x compilation (torch.compile)
     use_compile: bool = False
+    timing_sync: bool = True
 
     # Loss weights (Step 1A defaults)
     lambda_l1: float = 1.0

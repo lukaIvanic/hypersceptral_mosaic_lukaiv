@@ -55,13 +55,17 @@ def _log_partial_load(result: Any, context: str) -> None:
         logger.warning("[%s] Unexpected keys when loading state_dict: %s", context, unexpected)
 
 
-def _time_block(device: torch.device, fn: Callable[[], Any]) -> tuple[Any, float]:
+def _time_block(
+    device: torch.device,
+    fn: Callable[[], Any],
+    sync_cuda: bool,
+) -> tuple[Any, float]:
     """
     Measure the wall-time of ``fn`` with CUDA-aware synchronization.
     Returns (result, seconds).
     """
 
-    if device.type == "cuda":
+    if device.type == "cuda" and sync_cuda:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
@@ -181,6 +185,7 @@ def train_one_epoch(
     log_interval: int,
     epoch: int,
     inference_resize: int | None,
+    timing_sync: bool,
     profile_steps: int = 0,
     profile_output_dir: Path | None = None,
     profile_start_step: int = 1,
@@ -267,19 +272,21 @@ def train_one_epoch(
                     batch["target"].to(device, non_blocking=True),
                 )
 
-            (inputs, targets), preprocess_time = _time_block(device, _move_to_device)
+            (inputs, targets), preprocess_time = _time_block(device, _move_to_device, timing_sync)
             batch_size = inputs.size(0)
 
             optimizer.zero_grad(set_to_none=True)
             final_shape = tuple(int(dim) for dim in targets.shape[-2:])
             preds, forward_time = _time_block(
-                device, lambda: run_model_with_resize(model, inputs, inference_resize, final_shape)
+                device,
+                lambda: run_model_with_resize(model, inputs, inference_resize, final_shape),
+                timing_sync,
             )
             interp_time = getattr(model, "last_interp_time", 0.0)
 
-            loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets))
-            _, backward_time = _time_block(device, lambda: loss.backward())
-            _, optimizer_time = _time_block(device, optimizer.step)
+            loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
+            _, backward_time = _time_block(device, lambda: loss.backward(), timing_sync)
+            _, optimizer_time = _time_block(device, optimizer.step, timing_sync)
             loss_item_start = time.perf_counter()
             loss_value = float(loss.item())
             loss_item_time = time.perf_counter() - loss_item_start
@@ -492,6 +499,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.profile_with_stack = True
     if getattr(args, "use_compile", False):
         cfg.use_compile = True
+    if getattr(args, "no_timing_sync", False):
+        cfg.timing_sync = False
 
     # Data augmentation flags
     if getattr(args, "aug_rotate90", False):
@@ -596,6 +605,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.lambda_srgb_l1,
         cfg.lambda_srgb_ssim,
     )
+    if device.type == "cuda" and not cfg.timing_sync:
+        logger.info("[Timing] CUDA synchronization disabled; per-step timings are approximate.")
     if _PROCESS is None:
         logger.warning("psutil not available; RAM telemetry disabled.")
 
@@ -747,6 +758,7 @@ def main(args: argparse.Namespace) -> None:
             cfg.log_interval,
             epoch,
             cfg.train_inference_resize,
+            cfg.timing_sync,
             profile_steps=epoch_profile_steps,
             profile_output_dir=epoch_profile_dir,
             profile_start_step=cfg.profile_start_step,
@@ -880,6 +892,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--profile-with-stack",
         action="store_true",
         help="Include Python stack traces for profiler events (adds overhead).",
+    )
+    parser.add_argument(
+        "--no-timing-sync",
+        action="store_true",
+        help="Disable CUDA synchronizations in timing measurements (approximate timings, faster).",
     )
     parser.add_argument(
         "--use-compile",
