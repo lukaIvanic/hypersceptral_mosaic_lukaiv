@@ -184,6 +184,7 @@ def train_one_epoch(
     profile_steps: int = 0,
     profile_output_dir: Path | None = None,
     profile_start_step: int = 1,
+    profile_with_stack: bool = False,
 ) -> Dict[str, float]:
     model.train()
     running_loss = 0.0
@@ -241,7 +242,7 @@ def train_one_epoch(
             activities=activities,
             record_shapes=True,
             profile_memory=True,
-            with_stack=False,
+            with_stack=profile_with_stack,
             with_flops=False,
             on_trace_ready=trace_handler,
         )
@@ -487,6 +488,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.profile_dir = None if value == "" else Path(value)
     if getattr(args, "profile_start_step", None) is not None:
         cfg.profile_start_step = max(1, int(args.profile_start_step))
+    if getattr(args, "profile_with_stack", False):
+        cfg.profile_with_stack = True
     if getattr(args, "use_compile", False):
         cfg.use_compile = True
 
@@ -747,6 +750,7 @@ def main(args: argparse.Namespace) -> None:
             profile_steps=epoch_profile_steps,
             profile_output_dir=epoch_profile_dir,
             profile_start_step=cfg.profile_start_step,
+            profile_with_stack=cfg.profile_with_stack,
         )
         train_stats["lr"] = current_lr
         logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
@@ -871,6 +875,11 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="First training step (1-based) within the profiling epoch to capture.",
+    )
+    parser.add_argument(
+        "--profile-with-stack",
+        action="store_true",
+        help="Include Python stack traces for profiler events (adds overhead).",
     )
     parser.add_argument(
         "--use-compile",

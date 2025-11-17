@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import itertools
 from contextlib import nullcontext
+import math
 from typing import Callable, List, Tuple
 
 import torch
@@ -187,6 +188,12 @@ def _channel_multipliers(depth: int) -> List[int]:
     return multipliers
 
 
+def _align_channels(channels: int, multiple: int = 32) -> int:
+    if multiple <= 0:
+        return channels
+    return int(math.ceil(channels / multiple) * multiple)
+
+
 class UNetLiteHSI(nn.Module):
     """
     UNet-style backbone operating in pixel-unshuffled space with aggressive
@@ -309,7 +316,8 @@ class UNetLiteHSI(nn.Module):
         # Optional coarse + residual refinement head
         if self.use_residual_head:
             residual_in = latent_channels + out_channels
-            residual_hidden = max(latent_channels, out_channels)
+            residual_hidden_base = max(latent_channels, out_channels)
+            residual_hidden = _align_channels(residual_hidden_base)
             self.residual_head = nn.Sequential(
                 ResidualBlock(
                     residual_in,

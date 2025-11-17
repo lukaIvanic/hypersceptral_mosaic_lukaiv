@@ -54,6 +54,7 @@ class TrainConfig:
     profile_epoch: int = 1
     profile_dir: Path | None = None
     profile_start_step: int = 1
+    profile_with_stack: bool = False
 
     # Optional PyTorch 2.x compilation (torch.compile)
     use_compile: bool = False
