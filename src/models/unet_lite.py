@@ -413,14 +413,19 @@ class UNetLiteHSI(nn.Module):
         latent = self.activation(latent)
 
         coarse = self.coarse_head(latent)
-        if self.coarse_channels == self.out_channels:
+        coarse_channels = coarse.shape[1]
+        if coarse_channels > self.out_channels:
+            coarse = coarse[:, : self.out_channels, ...]
+            coarse_channels = self.out_channels
+
+        if coarse_channels == self.out_channels:
             spectral = coarse
             interp_time = 0.0
         else:
             start_interp = time.perf_counter()
             coarse_hw = coarse.permute(0, 2, 3, 1).contiguous()
             upsampled = F.interpolate(
-                coarse_hw.view(-1, 1, self.coarse_channels),
+                coarse_hw.view(-1, 1, coarse_channels),
                 size=self.out_channels,
                 mode="linear",
                 align_corners=True,
