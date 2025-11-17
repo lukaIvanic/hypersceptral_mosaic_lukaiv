@@ -258,8 +258,11 @@ class Track1Dataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_h5_files"] = {}
-        state["_ram_cache"] = {}
         return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._h5_files = {}
 
     def __del__(self):
         for handle in getattr(self, "_h5_files", {}).values():
@@ -293,8 +296,14 @@ class Track1Dataset(Dataset):
                         cube = _resize_tensor(cube, size, mode="area")
 
             if self.ram_cache and sample_id not in self._ram_cache:
-                stored_mosaic = mosaic.detach().clone()
-                stored_cube = cube.detach().clone() if cube.numel() > 0 else cube
+                stored_mosaic = mosaic.detach().contiguous()
+                stored_cube = cube.detach().contiguous() if cube.numel() > 0 else cube
+                try:
+                    stored_mosaic.share_memory_()
+                    if stored_cube.numel() > 0:
+                        stored_cube.share_memory_()
+                except RuntimeError:
+                    logger.warning("share_memory_ failed for sample %s", sample_id)
                 self._ram_cache[sample_id] = (stored_mosaic, stored_cube, orig_shape)
                 logger.debug(
                     "ram-cache-store: %s split=%s | entries=%d",
@@ -324,6 +333,17 @@ class Track1Dataset(Dataset):
             "id": example["id_str"],
         }
         return sample
+
+    def preload_ram_cache(self, limit: Optional[int] = None, log_interval: int = 16) -> None:
+        if not self.ram_cache:
+            return
+        total = len(self)
+        target = total if limit is None else min(limit, total)
+        for idx in range(target):
+            if idx % max(1, log_interval) == 0:
+                logger.debug("ram-cache-preload: %s %d/%d", self.split, idx, target)
+            _ = self[idx]
+
 
     def _load_hsi_cached(self, sample_id: str) -> torch.Tensor:
         if sample_id not in self._h5_files:
@@ -479,6 +499,19 @@ def create_dataloaders(
         write_cache=cfg.write_cache,
         ram_cache=cfg.ram_cache,
     )
+
+    if cfg.ram_cache and cfg.num_workers > 0:
+        logger.info(
+            "[RAM cache] Preloading train split (%d samples) before DataLoader spawn.",
+            len(train_ds),
+        )
+        train_ds.preload_ram_cache()
+        if val_ds.targets_available:
+            logger.info(
+                "[RAM cache] Preloading val split (%d samples) before DataLoader spawn.",
+                len(val_ds),
+            )
+            val_ds.preload_ram_cache()
 
     train_loader = DataLoader(
         train_ds,
