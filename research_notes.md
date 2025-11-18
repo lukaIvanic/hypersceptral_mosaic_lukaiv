@@ -1,6 +1,6 @@
 # Research Notes — 2026 ICASSP Hyper-Object Challenge (Track 1)
 
-Last updated: 2025-11-10
+Last updated: 2025-11-18
 
 ## 0) One-paragraph brief
 Reconstruct a 61-band hyperspectral reflectance cube (400–1000 nm, 10 nm step) from a single-plane Bayer-style mosaic (RGGB) acquired at commodity-camera resolution. Mosaics are RAW-like (linear, pre-ISP). Training provides paired mosaic/HSI; public/private/hidden tests evaluate with the SSC score (spectral, spatial, color components). Goal: high-fidelity spectral reconstruction from low-cost inputs.
@@ -313,6 +313,7 @@ np.savez("Category-1_a_0007.npz", cube=cube_hwc)  # (H,W,61), float32
 | 10 | All composite losses (aggressive weights) | unet-lite-res128-v4-all-loss | resize=128, bs=2, UNet-lite (base 64), λ `{L1:1.0, SAM:0.2, SID:0.2, sRGB_L1:0.2, sRGB_SSIM:0.2, ERGAS:0.2}`, lr=1e-3 cosine schedule | **13.8236** | **0.0620** | **29.3705** | **30.9755** | **0.9425** | **3.2705** | Training converged (best ep 95, loss=0.0173) but composite weights at 0.2 for every term slightly degraded SAM/SID/ERGAS relative to the λ_SAM-only baseline, indicating the aux losses need gentler weighting and staged introduction. | completed |
 | 11 | Residual head refinement | unet-lite-res128-v5-reshead | resize=128, bs=2, UNet-lite (base 64) + `--use-residual-head`, λ `{L1:1.0, SAM:0.2}`, lr=1e-3 cosine (warmup 5, η_min=1e-5), 180 epochs | **7.9279** | **0.0326** | **26.3974** | **31.6792** | **0.9434** | **2.1193** | Fine-tuned from the λ_SAM baseline with the residual refinement head active; best epoch 160 (loss 0.0111). Delivers the largest SAM/SID improvement so far while preserving spatial/color metrics. | completed |
 | 12 | Residual head + spectral conv | unet-lite-res128-v5_1-reshead-spec | Same as Stage 11 plus `--use-spectral-conv --spectral-conv-kernel-size 3` (per-pixel 1D smoothing) | **7.8901** | **0.0325** | **26.0315** | **31.7652** | **0.9432** | **2.0937** | Adds spectral 1D convolution atop the residual head. Slight further gains in SAM/ERGAS/ΔE00 (best epoch 179, loss 0.0109). Candidate for Kaggle submission. | completed |
+| 13 | Native 1024 UNet-lite + residual head (coarse=11) | unet-lite-res512-v5-reshead | resize=1024, bs=2; `model_variant=unet_lite`; `unet_base_channels=64`; `latent_channels=32`; `encoder_depth=6`; `coarse_channels=11`; lr=1e-3 cosine (warmup 5, η_min=1e-5); λ `{L1:1.0, SAM:0.2, SID:0.0, sRGB_L1:0.0, sRGB_SSIM:0.0, ERGAS:0.0}`; `--use-residual-head`; epochs=180; resume | **7.5673** | **0.0302** | **11.9962** | **40.0959** | **0.9678** | **1.5505** | Kaggle accuracy 0.3254 (public). Per-band MAE shows a U-shape with larger error at spectrum ends (<≈440 nm, >≈930 nm). Thin vertical residual columns at band extremes likely column FPN in GT + model’s early downsampling. | completed |
 | … | (extend as needed) | | | | | | | | | | |
 
 

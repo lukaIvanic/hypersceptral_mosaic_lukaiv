@@ -261,6 +261,7 @@ def load_model(
         stochastic_depth_p=cfg.stochastic_depth_p,
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
+        norm_type=cfg.norm_type,
     ).to(device)
     model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -328,6 +329,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.coarse_output_channels = max(1, args.coarse_channels)
     if getattr(args, "conv_kernel_size", None) is not None:
         cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
+    if getattr(args, "norm_type", None) is not None:
+        cfg.norm_type = args.norm_type.lower()
     if getattr(args, "use_residual_head", False):
         cfg.use_residual_head = True
     if getattr(args, "use_spectral_conv", False):
@@ -683,6 +686,13 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of coarse spectral channels before interpolation (default from config).",
+    )
+    parser.add_argument(
+        "--norm-type",
+        type=str,
+        default=None,
+        choices=("group", "rms", "none"),
+        help="Normalization applied inside UNet-lite blocks (group, rms, none).",
     )
     parser.add_argument(
         "--use-residual-head",
