@@ -19,7 +19,7 @@ from .data import create_dataloaders
 from .losses import CompositeSpectralLoss, LossWeights
 from .metrics import aggregate
 from .models.builder import create_model
-from .utils.inference import run_model_with_resize
+from .utils.inference import run_model_with_resize, sliding_window_inference
 from .utils.metrics.schema import (
     ACCURACY_METRIC_UNITS,
     SOURCE_TRAIN,
@@ -386,6 +386,8 @@ def evaluate(
     device: torch.device,
     loss_fn: nn.Module,
     inference_resize: int | None,
+    val_crop_size: int | None,
+    val_crop_overlap: float,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -398,7 +400,20 @@ def evaluate(
         batch_size = inputs.size(0)
 
         final_shape = tuple(int(dim) for dim in targets.shape[-2:])
-        preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
+        if val_crop_size is not None:
+            preds_list = []
+            for index in range(batch_size):
+                pred_tensor = sliding_window_inference(
+                    model,
+                    inputs[index],
+                    val_crop_size,
+                    val_crop_overlap,
+                    inference_resize,
+                )
+                preds_list.append(pred_tensor)
+            preds = torch.stack(preds_list, dim=0)
+        else:
+            preds = run_model_with_resize(model, inputs, inference_resize, final_shape)
         loss = loss_fn(preds, targets)
 
         total_loss += loss.item() * batch_size
@@ -447,6 +462,18 @@ def main(args: argparse.Namespace) -> None:
         cfg.train_micro_batch_size = max(1, int(args.step_batch_size))
     if getattr(args, "accum_batch_size", None) is not None:
         cfg.effective_batch_size = max(1, int(args.accum_batch_size))
+    if getattr(args, "train_crop_size", None) is not None:
+        crop_val = int(args.train_crop_size)
+        if crop_val <= 0:
+            raise ValueError("--train-crop-size must be a positive integer.")
+        cfg.train_crop_size = crop_val
+    if getattr(args, "val_crop_size", None) is not None:
+        crop_val = int(args.val_crop_size)
+        if crop_val <= 0:
+            raise ValueError("--val-crop-size must be a positive integer.")
+        cfg.val_crop_size = crop_val
+    if getattr(args, "val_crop_overlap", None) is not None:
+        cfg.val_crop_overlap = float(args.val_crop_overlap)
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if args.learning_rate is not None:
@@ -584,6 +611,32 @@ def main(args: argparse.Namespace) -> None:
     if cfg.grad_accumulation_steps < 1:
         raise ValueError("Gradient accumulation steps must be at least 1.")
 
+    if cfg.train_crop_size is not None:
+        allowed_resize = {None, 1024}
+        if cfg.resize_to not in allowed_resize:
+            raise ValueError(
+                "--train-crop-size requires --resize-to to be unset or 1024."
+            )
+        if cfg.train_crop_size > 1024:
+            raise ValueError("train_crop_size must be <= 1024 for the native dataset.")
+
+    if cfg.val_crop_size is None and cfg.train_crop_size is not None:
+        cfg.val_crop_size = cfg.train_crop_size
+
+    if cfg.val_crop_size is not None:
+        allowed_resize = {None, 1024}
+        if cfg.resize_to not in allowed_resize:
+            raise ValueError(
+                "--val-crop-size requires --resize-to to be unset or 1024."
+            )
+        if cfg.val_crop_size > 1024:
+            raise ValueError("val_crop_size must be <= 1024 for the native dataset.")
+
+    if cfg.val_crop_overlap < 0.0 or cfg.val_crop_overlap >= 1.0:
+        raise ValueError("--val-crop-overlap must be in [0.0, 1.0).")
+    if cfg.val_crop_overlap > 0.0 and cfg.val_crop_size is None:
+        raise ValueError("--val-crop-overlap requires --val-crop-size to be set.")
+
     set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
@@ -652,6 +705,14 @@ def main(args: argparse.Namespace) -> None:
         cfg.grad_accumulation_steps,
         cfg.effective_batch_size,
     )
+    if cfg.train_crop_size is not None:
+        logger.info("[Patch] train_crop_size=%d (random training crops enabled)", cfg.train_crop_size)
+    if cfg.val_crop_size is not None:
+        logger.info(
+            "[ValPatch] val_crop_size=%d | overlap=%.2f (sliding-window validation)",
+            cfg.val_crop_size,
+            cfg.val_crop_overlap,
+        )
     logger.info(
         "[Loss] lambda_l1=%.3f | lambda_sam=%.3f | lambda_sid=%.3f | "
         "lambda_ergas=%.3f | lambda_srgb_l1=%.3f | lambda_srgb_ssim=%.3f",
@@ -869,6 +930,8 @@ def main(args: argparse.Namespace) -> None:
                 device,
                 loss_fn,
                 cfg.train_inference_resize,
+                cfg.val_crop_size,
+                cfg.val_crop_overlap,
             )
             metrics_str = " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
             logger.info("[Val] Epoch %d | %s", epoch, metrics_str)
@@ -990,6 +1053,24 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional spatial size to downsample inputs before the model forward; loss is still computed at native resolution.",
+    )
+    parser.add_argument(
+        "--train-crop-size",
+        type=int,
+        default=None,
+        help="Enable random square crops of this size for training batches (patch training).",
+    )
+    parser.add_argument(
+        "--val-crop-size",
+        type=int,
+        default=None,
+        help="Slide a validation window of this square size at eval time (defaults to train crop size when unset).",
+    )
+    parser.add_argument(
+        "--val-crop-overlap",
+        type=float,
+        default=None,
+        help="Fractional overlap (0.0-<1.0) between sliding-window validation patches.",
     )
     parser.add_argument(
         "--prefetch-factor",

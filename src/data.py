@@ -187,6 +187,37 @@ def random_intensity_jitter(
     return sample
 
 
+def random_fixed_crop(sample: TensorDict, crop_size: int) -> TensorDict:
+    """
+    Extract a random crop of size (crop_size, crop_size) from the sample tensors.
+
+    The same crop is applied to both the mosaic input and hyperspectral cube.
+    """
+    if crop_size <= 0:
+        raise ValueError("crop_size must be positive.")
+
+    mosaic = sample["input"]
+    cube = sample["target"]
+    if mosaic.dim() != 3:
+        raise ValueError(f"Expected CHW tensor for mosaic, got shape {mosaic.shape}")
+
+    _, h, w = mosaic.shape
+    if h < crop_size or w < crop_size:
+        raise ValueError(
+            f"Crop size {crop_size} exceeds sample dimensions ({h}, {w})."
+        )
+
+    top = random.randint(0, h - crop_size)
+    left = random.randint(0, w - crop_size)
+    bottom = top + crop_size
+    right = left + crop_size
+
+    sample["input"] = mosaic[:, top:bottom, left:right]
+    if cube.numel() > 0:
+        sample["target"] = cube[:, top:bottom, left:right]
+    return sample
+
+
 class Track1Dataset(Dataset):
     """
     Thin PyTorch dataset for Track 1.
@@ -209,6 +240,7 @@ class Track1Dataset(Dataset):
         cache_dir: Optional[Path] = None,
         write_cache: bool = True,
         ram_cache: bool = False,
+        crop_size: Optional[int] = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -217,6 +249,7 @@ class Track1Dataset(Dataset):
         self.resize_to = resize_to
         self.write_cache = write_cache
         self.ram_cache = ram_cache
+        self.crop_size = crop_size
 
         if split == "train":
             mosaic_dir = self.root / "train" / "mosaic"
@@ -319,6 +352,9 @@ class Track1Dataset(Dataset):
             "id_str": sample_id,
             "orig_shape": orig_shape,
         }
+
+        if self.crop_size is not None:
+            example = random_fixed_crop(example, self.crop_size)
 
         if self.augment and self.targets_available:
             example = random_flip(example)
@@ -489,6 +525,7 @@ def create_dataloaders(
         write_cache=cfg.write_cache,
         ram_cache=cfg.ram_cache,
         transform=train_transform,
+        crop_size=cfg.train_crop_size,
     )
     val_ds = Track1Dataset(
         root=cfg.data_root,

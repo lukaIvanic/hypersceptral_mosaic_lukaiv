@@ -29,6 +29,11 @@ class TrainConfig:
     effective_batch_size: int | None = None
     grad_accumulation_steps: int = 1
 
+    # Patch-based training
+    train_crop_size: int | None = None
+    val_crop_size: int | None = None
+    val_crop_overlap: float = 0.0
+
     num_workers: int = 0
     prefetch_factor: int = 2
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
