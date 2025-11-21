@@ -22,7 +22,6 @@
 
 architectures:
 - [ ] **HSCCN-R/D**
-- [ ] 
 - [ ] **AWAN**
 - [ ] **MST/MST++**
 - [ ] **EDSR-style Residual Networks**
