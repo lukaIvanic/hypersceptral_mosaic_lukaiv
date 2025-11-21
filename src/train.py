@@ -186,6 +186,7 @@ def train_one_epoch(
     epoch: int,
     inference_resize: int | None,
     timing_sync: bool,
+    grad_accum_steps: int,
     profile_steps: int = 0,
     profile_output_dir: Path | None = None,
     profile_start_step: int = 1,
@@ -195,6 +196,11 @@ def train_one_epoch(
     running_loss = 0.0
     num_samples = 0
     steps_total = len(loader)
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    accum_remainder = steps_total % grad_accum_steps if grad_accum_steps > 0 else 0
+    last_group_start = (
+        steps_total - accum_remainder + 1 if accum_remainder != 0 else steps_total + 1
+    )
     timings = {
         "io": 0.0,
         "preprocess": 0.0,
@@ -260,6 +266,8 @@ def train_one_epoch(
             "" if profile_output_dir is None else f" (traces -> {profile_output_dir})",
         )
 
+    optimizer.zero_grad(set_to_none=True)
+
     try:
         for step, batch in enumerate(loader, start=1):
             step_start_time = prev_time
@@ -275,7 +283,6 @@ def train_one_epoch(
             (inputs, targets), preprocess_time = _time_block(device, _move_to_device, timing_sync)
             batch_size = inputs.size(0)
 
-            optimizer.zero_grad(set_to_none=True)
             final_shape = tuple(int(dim) for dim in targets.shape[-2:])
             preds, forward_time = _time_block(
                 device,
@@ -284,11 +291,22 @@ def train_one_epoch(
             )
             interp_time = getattr(model, "last_interp_time", 0.0)
 
-            loss, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
+            loss_raw, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
+            current_accum_target = (
+                accum_remainder if accum_remainder != 0 and step >= last_group_start else grad_accum_steps
+            )
+            loss = loss_raw / current_accum_target
             _, backward_time = _time_block(device, lambda: loss.backward(), timing_sync)
-            _, optimizer_time = _time_block(device, optimizer.step, timing_sync)
+            accum_position = ((step - 1) % grad_accum_steps) + 1
+            if accum_position > current_accum_target:
+                accum_position = current_accum_target
+            optimizer_time = 0.0
+            should_step = (step % grad_accum_steps == 0) or (step == steps_total)
+            if should_step:
+                _, optimizer_time = _time_block(device, optimizer.step, timing_sync)
+                optimizer.zero_grad(set_to_none=True)
             loss_item_start = time.perf_counter()
-            loss_value = float(loss.item())
+            loss_value = float(loss_raw.detach().item())
             loss_item_time = time.perf_counter() - loss_item_start
 
             running_loss += loss_value * batch_size
@@ -315,7 +333,7 @@ def train_one_epoch(
             logger.debug(
                 "epoch %d step %d/%d | io=%.2f ms | preprocess=%.2f ms | forward=%.2f ms | "
                 "loss_fn=%.2f ms | backward=%.2f ms | optimizer=%.2f ms | loss_item=%.2f ms | "
-                "interp=%.2f ms | wall=%.2f ms%s",
+                "interp=%.2f ms | wall=%.2f ms | accum=%d/%d%s",
                 epoch,
                 step,
                 steps_total,
@@ -328,6 +346,8 @@ def train_one_epoch(
                 loss_item_time * 1e3,
                 interp_time * 1e3,
                 (step_end_time - step_start_time) * 1e3,
+                accum_position,
+                current_accum_target,
                 "" if ram_mb is None else f" | ram={ram_mb:.1f} MB",
             )
 
@@ -423,6 +443,10 @@ def main(args: argparse.Namespace) -> None:
         cfg.run_name = args.run_name
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if getattr(args, "step_batch_size", None) is not None:
+        cfg.train_micro_batch_size = max(1, int(args.step_batch_size))
+    if getattr(args, "accum_batch_size", None) is not None:
+        cfg.effective_batch_size = max(1, int(args.accum_batch_size))
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if args.learning_rate is not None:
@@ -533,6 +557,33 @@ def main(args: argparse.Namespace) -> None:
     if getattr(args, "resume", False) and getattr(args, "init_from", None):
         raise ValueError("Cannot use --resume and --init-from together.")
 
+    step_batch_size = cfg.train_micro_batch_size or cfg.batch_size
+    if step_batch_size is None or step_batch_size <= 0:
+        raise ValueError("Per-step batch size must be a positive integer.")
+    step_batch_size = int(step_batch_size)
+    cfg.train_micro_batch_size = step_batch_size
+    cfg.batch_size = step_batch_size
+
+    accum_batch_size = cfg.effective_batch_size
+    if accum_batch_size is not None:
+        accum_batch_size = int(accum_batch_size)
+        if accum_batch_size < step_batch_size:
+            raise ValueError(
+                "Accumulated batch size must be greater than or equal to the per-step batch size."
+            )
+        if accum_batch_size % step_batch_size != 0:
+            raise ValueError(
+                "Accumulated batch size must be an integer multiple of the per-step batch size."
+            )
+        cfg.grad_accumulation_steps = accum_batch_size // step_batch_size
+    else:
+        cfg.grad_accumulation_steps = max(1, int(cfg.grad_accumulation_steps or 1))
+        accum_batch_size = step_batch_size * cfg.grad_accumulation_steps
+        cfg.effective_batch_size = accum_batch_size
+
+    if cfg.grad_accumulation_steps < 1:
+        raise ValueError("Gradient accumulation steps must be at least 1.")
+
     set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
@@ -594,6 +645,12 @@ def main(args: argparse.Namespace) -> None:
         resume_info,
         cfg.model_variant,
         run_dir,
+    )
+    logger.info(
+        "[Batch] step=%d | accum_steps=%d | effective=%d",
+        cfg.train_micro_batch_size,
+        cfg.grad_accumulation_steps,
+        cfg.effective_batch_size,
     )
     logger.info(
         "[Loss] lambda_l1=%.3f | lambda_sam=%.3f | lambda_sid=%.3f | "
@@ -759,6 +816,7 @@ def main(args: argparse.Namespace) -> None:
             epoch,
             cfg.train_inference_resize,
             cfg.timing_sync,
+            cfg.grad_accumulation_steps,
             profile_steps=epoch_profile_steps,
             profile_output_dir=epoch_profile_dir,
             profile_start_step=cfg.profile_start_step,
@@ -864,6 +922,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run subdirectory under the model's runs folder")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--step-batch-size",
+        type=int,
+        default=None,
+        help="Per-optimizer-step batch size (micro-batch). Overrides --batch-size for training steps if provided.",
+    )
+    parser.add_argument(
+        "--accum-batch-size",
+        type=int,
+        default=None,
+        help="Effective batch size after gradient accumulation. Must be a multiple of the step batch size.",
+    )
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)

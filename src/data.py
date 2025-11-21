@@ -513,9 +513,14 @@ def create_dataloaders(
             )
             val_ds.preload_ram_cache()
 
+    train_batch_size = cfg.train_micro_batch_size or cfg.batch_size
+    if train_batch_size is None or train_batch_size <= 0:
+        raise ValueError("Per-step train batch size must be a positive integer.")
+    val_batch_size = cfg.batch_size if cfg.batch_size and cfg.batch_size > 0 else train_batch_size
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.batch_size,
+        batch_size=train_batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=True,
@@ -524,7 +529,7 @@ def create_dataloaders(
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=cfg.batch_size,
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=True,

@@ -24,6 +24,11 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
 
+    # Gradient accumulation / batching
+    train_micro_batch_size: int | None = None
+    effective_batch_size: int | None = None
+    grad_accumulation_steps: int = 1
+
     num_workers: int = 0
     prefetch_factor: int = 2
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

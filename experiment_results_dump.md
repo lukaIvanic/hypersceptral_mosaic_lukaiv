@@ -1,0 +1,4 @@
+### Smaller model, only 30 epochs
+- python -m src.train --data-root data/track1 --run-name unet-lite-res1024-v7-slim --model-variant unet_lite --unet-base-channels 48 --latent-channels 24 --encoder-depth 5 --coarse-channels 61 --resize-to 1024 --num-workers 8 --prefetch-factor 4 --epochs 30 --batch-size 2 --learning-rate 6e-4 --lr-scheduler cosine --scheduler-warmup-epochs 5 --scheduler-warmup-start-factor 0.2 --scheduler-min-lr 1e-6  --lambda-l1 1.0 --lambda-sam 0.2 --lambda-sid 0.0 --lambda-srgb-l1 0.0 --lambda-srgb-ssim 0.0 --lambda-ergas 0.0  --use-residual-head --log-level DEBUG --use-spectral-conv --spectral-conv-kernel-size 5 --resume #  --profile-steps 2 --profile-epoch 2 --profile-start-step 5   # --allow-partial-load
+- 2025-11-21 12:09:38,732 INFO __main__: [Val] Epoch 30 | mae=0.0273 | mse=0.0058 | psnr=28.4291 | sam=9.7708 | ergas=32.7246 | loss=0.0316
+- took 25 minutes
