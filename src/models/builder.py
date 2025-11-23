@@ -6,6 +6,7 @@ from torch import nn
 
 from .simple_cnn.model import SimpleCNN
 from .unet_lite import UNetLiteHSI
+from .mst_plus_plus import MST_Plus_Plus
 
 
 def create_model(
@@ -55,5 +56,17 @@ def create_model(
             conv_kernel_size=conv_kernel_size,
             norm_type=norm_type,
         )
-    raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite.")
+    if variant_norm == "mst_plus_plus":
+        # MST++ uses n_feat instead of hidden_channels conceptually, 
+        # but we can map hidden_channels if provided, or default to 31
+        # The original paper/code uses 31 as default.
+        n_feat = hidden_channels if hidden_channels and hidden_channels > 0 else 31
+        
+        return MST_Plus_Plus(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            n_feat=n_feat,
+            stage=3 # Default stage from MST++
+        )
+    raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite, mst_plus_plus.")
 
