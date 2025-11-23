@@ -113,27 +113,26 @@ class MS_MSA(nn.Module):
         return out: [b,h,w,c]
         """
         b, h, w, c = x_in.shape
-        x = x_in.reshape(b,h*w,c)
-        q_inp = self.to_q(x)
-        k_inp = self.to_k(x)
-        v_inp = self.to_v(x)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads),
+        
+        q_inp = self.to_q(x_in)
+        k_inp = self.to_k(x_in)
+        v_inp = self.to_v(x_in)
+        
+        q, k, v = map(lambda t: rearrange(t, 'b h w (heads c) -> b heads c (h w)', heads=self.num_heads),
                                 (q_inp, k_inp, v_inp))
-        v = v
-        # q: b,heads,hw,c
-        q = q.transpose(-2, -1)
-        k = k.transpose(-2, -1)
-        v = v.transpose(-2, -1)
+        
         q = F.normalize(q, dim=-1, p=2)
         k = F.normalize(k, dim=-1, p=2)
-        attn = (k @ q.transpose(-2, -1))   # A = K^T*Q
+        
+        attn = (q @ k.transpose(-2, -1))
         attn = attn * self.rescale
         attn = attn.softmax(dim=-1)
-        x = attn @ v   # b,heads,d,hw
-        x = x.permute(0, 3, 1, 2)    # Transpose
-        x = x.reshape(b, h * w, self.num_heads * self.dim_head)
-        out_c = self.proj(x).view(b, h, w, c)
-        out_p = self.pos_emb(v_inp.reshape(b,h,w,c).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        
+        x = attn @ v
+        x = rearrange(x, 'b heads c (h w) -> b h w (heads c)', h=h, w=w)
+        
+        out_c = self.proj(x)
+        out_p = self.pos_emb(v_inp.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         out = out_c + out_p
 
         return out
