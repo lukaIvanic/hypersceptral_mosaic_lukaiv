@@ -216,6 +216,7 @@ def train_one_epoch(
     grad_accum_steps: int,
     scheduler: Optional[WarmupCosineScheduler] = None,
     use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
     scaler: Optional[torch.amp.GradScaler] = None,
     profile_steps: int = 0,
     profile_output_dir: Path | None = None,
@@ -315,9 +316,9 @@ def train_one_epoch(
 
             final_shape = tuple(int(dim) for dim in targets.shape[-2:])
             
-            # AMP: wrap forward pass in autocast context for FP16 compute
+            # AMP: wrap forward pass in autocast context for mixed precision compute
             if use_amp:
-                with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
                     preds, forward_time = _time_block(
                         device,
                         lambda: run_model_with_resize(model, inputs, inference_resize, final_shape),
@@ -874,11 +875,21 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # AMP: Create GradScaler for mixed precision training
+    # BF16 is preferred on Ampere+ GPUs (A100, RTX 30xx, RTX 40xx) - no scaling needed
+    # FP16 requires GradScaler to handle gradient overflow
     scaler: Optional[torch.amp.GradScaler] = None
+    amp_dtype = torch.float16  # Default
     if cfg.use_amp:
         if device.type == "cuda":
-            scaler = torch.amp.GradScaler()
-            logger.info("[AMP] Mixed precision training enabled (FP16 on CUDA)")
+            # Check if BF16 is supported (Ampere+ GPUs: compute capability >= 8.0)
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+                scaler = None  # BF16 doesn't need gradient scaling
+                logger.info("[AMP] Mixed precision training enabled (BF16 on CUDA - optimal for A100/Ampere+)")
+            else:
+                amp_dtype = torch.float16
+                scaler = torch.amp.GradScaler()
+                logger.info("[AMP] Mixed precision training enabled (FP16 on CUDA with GradScaler)")
         else:
             logger.warning("[AMP] Requested but device is %s; AMP only benefits CUDA. Disabling.", device.type)
             cfg.use_amp = False
@@ -967,6 +978,7 @@ def main(args: argparse.Namespace) -> None:
             cfg.grad_accumulation_steps,
             scheduler=scheduler,  # Step-level LR scheduling inside training loop
             use_amp=cfg.use_amp,
+            amp_dtype=amp_dtype,
             scaler=scaler,
             profile_steps=epoch_profile_steps,
             profile_output_dir=epoch_profile_dir,
