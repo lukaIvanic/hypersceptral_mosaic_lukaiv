@@ -84,38 +84,44 @@ def _time_block(
 class WarmupCosineScheduler:
     """
     Lightweight cosine scheduler with optional linear warmup.
+    
+    NOW OPERATES AT STEP-LEVEL GRANULARITY for smoother LR transitions.
+    Call step() after each optimizer step, not after each epoch.
     """
 
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
         base_lr: float,
-        total_epochs: int,
-        warmup_epochs: int,
+        total_steps: int,
+        warmup_steps: int,
         warmup_start_factor: float,
         eta_min: float,
     ) -> None:
         self.optimizer = optimizer
         self.base_lr = base_lr
-        self.total_epochs = max(total_epochs, 1)
-        self.warmup_epochs = max(min(warmup_epochs, self.total_epochs - 1), 0)
+        self.total_steps = max(total_steps, 1)
+        self.warmup_steps = max(min(warmup_steps, self.total_steps - 1), 0)
         self.warmup_start_factor = float(max(min(warmup_start_factor, 1.0), 1e-4))
         self.eta_min = float(max(min(eta_min, base_lr), 0.0))
-        self._last_lr = base_lr
+        self._last_lr = base_lr * warmup_start_factor if warmup_steps > 0 else base_lr
+        self._current_step = 0
+        # Apply initial LR
+        for group in self.optimizer.param_groups:
+            group["lr"] = self._last_lr
 
-    def _compute_warmup_lr(self, epoch_index: int) -> float:
-        if self.warmup_epochs <= 0:
+    def _compute_warmup_lr(self, step_index: int) -> float:
+        if self.warmup_steps <= 0:
             return self.base_lr
-        if self.warmup_epochs == 1:
-            return self.base_lr
-        progress = epoch_index / max(self.warmup_epochs - 1, 1)
+        # Linear warmup from warmup_start_factor to 1.0
+        progress = step_index / max(self.warmup_steps, 1)
         progress = float(max(min(progress, 1.0), 0.0))
         factor = self.warmup_start_factor + (1.0 - self.warmup_start_factor) * progress
         return self.base_lr * factor
 
-    def _compute_cosine_lr(self, epoch_index: int) -> float:
-        cosine_epochs = max(self.total_epochs - self.warmup_epochs, 1)
-        progress = (epoch_index - self.warmup_epochs) / cosine_epochs
+    def _compute_cosine_lr(self, step_index: int) -> float:
+        cosine_steps = max(self.total_steps - self.warmup_steps, 1)
+        progress = (step_index - self.warmup_steps) / cosine_steps
         progress = float(max(min(progress, 1.0), 0.0))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         if self.base_lr <= 0:
@@ -124,25 +130,42 @@ class WarmupCosineScheduler:
         factor = min_factor + (1.0 - min_factor) * cosine
         return self.base_lr * factor
 
-    def step(self, epoch_index: int) -> float:
-        if epoch_index < self.warmup_epochs:
-            lr = self._compute_warmup_lr(epoch_index)
+    def step(self) -> float:
+        """
+        Update LR for the current step and advance step counter.
+        Call this AFTER each optimizer.step().
+        """
+        if self._current_step < self.warmup_steps:
+            lr = self._compute_warmup_lr(self._current_step)
         else:
-            lr = self._compute_cosine_lr(epoch_index)
+            lr = self._compute_cosine_lr(self._current_step)
 
         for group in self.optimizer.param_groups:
             group["lr"] = lr
         self._last_lr = lr
+        self._current_step += 1
         return lr
 
     def get_last_lr(self) -> float:
         return self._last_lr
+    
+    def get_current_step(self) -> int:
+        return self._current_step
 
 
 def create_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg: TrainConfig,
+    steps_per_epoch: int,
 ) -> Optional[WarmupCosineScheduler]:
+    """
+    Create step-level LR scheduler.
+    
+    Args:
+        optimizer: The optimizer to schedule
+        cfg: Training config
+        steps_per_epoch: Number of optimizer steps per epoch (len(loader) // grad_accum)
+    """
     name = getattr(cfg, "lr_scheduler", "none").lower()
     if name in {"none", "", "off"}:
         return None
@@ -152,17 +175,21 @@ def create_scheduler(
         )
 
     base_lr = optimizer.param_groups[0]["lr"]
+    total_steps = cfg.epochs * steps_per_epoch
+    warmup_steps = cfg.scheduler_warmup_epochs * steps_per_epoch
+    
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
         base_lr=base_lr,
-        total_epochs=cfg.epochs,
-        warmup_epochs=cfg.scheduler_warmup_epochs,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
         warmup_start_factor=cfg.scheduler_warmup_start_factor,
         eta_min=cfg.scheduler_min_lr,
     )
     logger.info(
-        "[Scheduler] cosine | warmup_epochs=%d | start_factor=%.3f | eta_min=%.2e",
-        scheduler.warmup_epochs,
+        "[Scheduler] cosine (step-level) | total_steps=%d | warmup_steps=%d | start_factor=%.3f | eta_min=%.2e",
+        total_steps,
+        warmup_steps,
         cfg.scheduler_warmup_start_factor,
         cfg.scheduler_min_lr,
     )
@@ -187,6 +214,9 @@ def train_one_epoch(
     inference_resize: int | None,
     timing_sync: bool,
     grad_accum_steps: int,
+    scheduler: Optional[WarmupCosineScheduler] = None,
+    use_amp: bool = False,
+    scaler: Optional[torch.amp.GradScaler] = None,
     profile_steps: int = 0,
     profile_output_dir: Path | None = None,
     profile_start_step: int = 1,
@@ -284,27 +314,55 @@ def train_one_epoch(
             batch_size = inputs.size(0)
 
             final_shape = tuple(int(dim) for dim in targets.shape[-2:])
-            preds, forward_time = _time_block(
-                device,
-                lambda: run_model_with_resize(model, inputs, inference_resize, final_shape),
-                timing_sync,
-            )
-            interp_time = getattr(model, "last_interp_time", 0.0)
+            
+            # AMP: wrap forward pass in autocast context for FP16 compute
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                    preds, forward_time = _time_block(
+                        device,
+                        lambda: run_model_with_resize(model, inputs, inference_resize, final_shape),
+                        timing_sync,
+                    )
+                    interp_time = getattr(model, "last_interp_time", 0.0)
+                    loss_raw, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
+            else:
+                preds, forward_time = _time_block(
+                    device,
+                    lambda: run_model_with_resize(model, inputs, inference_resize, final_shape),
+                    timing_sync,
+                )
+                interp_time = getattr(model, "last_interp_time", 0.0)
+                loss_raw, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
 
-            loss_raw, loss_fn_time = _time_block(device, lambda: loss_fn(preds, targets), timing_sync)
             current_accum_target = (
                 accum_remainder if accum_remainder != 0 and step >= last_group_start else grad_accum_steps
             )
             loss = loss_raw / current_accum_target
-            _, backward_time = _time_block(device, lambda: loss.backward(), timing_sync)
+            
+            # AMP: scale loss and backward with GradScaler
+            if use_amp and scaler is not None:
+                _, backward_time = _time_block(device, lambda: scaler.scale(loss).backward(), timing_sync)
+            else:
+                _, backward_time = _time_block(device, lambda: loss.backward(), timing_sync)
+            
             accum_position = ((step - 1) % grad_accum_steps) + 1
             if accum_position > current_accum_target:
                 accum_position = current_accum_target
             optimizer_time = 0.0
+            scheduler_time = 0.0
             should_step = (step % grad_accum_steps == 0) or (step == steps_total)
             if should_step:
-                _, optimizer_time = _time_block(device, optimizer.step, timing_sync)
+                # AMP: unscale gradients and step optimizer through scaler
+                if use_amp and scaler is not None:
+                    _, optimizer_time = _time_block(device, lambda: (scaler.step(optimizer), scaler.update()), timing_sync)
+                else:
+                    _, optimizer_time = _time_block(device, optimizer.step, timing_sync)
                 optimizer.zero_grad(set_to_none=True)
+                # Step-level LR scheduling: update LR after each optimizer step
+                if scheduler is not None:
+                    sched_start = time.perf_counter()
+                    scheduler.step()
+                    scheduler_time = time.perf_counter() - sched_start
             loss_item_start = time.perf_counter()
             loss_value = float(loss_raw.detach().item())
             loss_item_time = time.perf_counter() - loss_item_start
@@ -376,6 +434,9 @@ def train_one_epoch(
 
     avg_times = {k: (v / max(steps_total, 1)) for k, v in timings.items()}
     avg_times["loss"] = running_loss / max(num_samples, 1)
+    # Include final LR from scheduler (if present)
+    if scheduler is not None:
+        avg_times["lr"] = scheduler.get_last_lr()
     return avg_times
 
 
@@ -550,6 +611,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.profile_with_stack = True
     if getattr(args, "use_compile", False):
         cfg.use_compile = True
+    if getattr(args, "use_amp", False):
+        cfg.use_amp = True
     if getattr(args, "no_timing_sync", False):
         cfg.timing_sync = False
 
@@ -785,7 +848,20 @@ def main(args: argparse.Namespace) -> None:
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
-    scheduler = create_scheduler(optimizer, cfg)
+    
+    # Calculate steps per epoch for step-level LR scheduling
+    # steps_per_epoch = number of optimizer steps = ceil(batches / grad_accum)
+    batches_per_epoch = len(train_loader)
+    steps_per_epoch = (batches_per_epoch + cfg.grad_accumulation_steps - 1) // cfg.grad_accumulation_steps
+    logger.info(
+        "[Schedule] batches_per_epoch=%d | grad_accum=%d | steps_per_epoch=%d | total_steps=%d",
+        batches_per_epoch,
+        cfg.grad_accumulation_steps,
+        steps_per_epoch,
+        steps_per_epoch * cfg.epochs,
+    )
+    
+    scheduler = create_scheduler(optimizer, cfg, steps_per_epoch)
     loss_fn = CompositeSpectralLoss(
         LossWeights(
             lambda_l1=cfg.lambda_l1,
@@ -796,6 +872,16 @@ def main(args: argparse.Namespace) -> None:
             lambda_srgb_ssim=cfg.lambda_srgb_ssim,
         )
     )
+
+    # AMP: Create GradScaler for mixed precision training
+    scaler: Optional[torch.amp.GradScaler] = None
+    if cfg.use_amp:
+        if device.type == "cuda":
+            scaler = torch.amp.GradScaler()
+            logger.info("[AMP] Mixed precision training enabled (FP16 on CUDA)")
+        else:
+            logger.warning("[AMP] Requested but device is %s; AMP only benefits CUDA. Disabling.", device.type)
+            cfg.use_amp = False
 
     best_val = history_best_val if history_best_val < float("inf") else float("inf")
     start_epoch = 1
@@ -857,16 +943,17 @@ def main(args: argparse.Namespace) -> None:
         return
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        if scheduler is not None:
-            current_lr = scheduler.step(epoch - 1)
-        else:
-            current_lr = optimizer.param_groups[0]["lr"]
+        # Get starting LR for this epoch (for logging)
+        start_lr = scheduler.get_last_lr() if scheduler is not None else optimizer.param_groups[0]["lr"]
+        
         epoch_profile_steps = 0
         epoch_profile_dir: Path | None = None
         if cfg.profile_steps > 0 and epoch == cfg.profile_epoch:
             profile_root = cfg.profile_dir or (run_dir / "profiling")
             epoch_profile_dir = profile_root / f"epoch_{epoch:03d}"
             epoch_profile_steps = cfg.profile_steps
+        
+        # Scheduler is now passed to train_one_epoch for step-level updates
         train_stats = train_one_epoch(
             model,
             train_loader,
@@ -878,13 +965,26 @@ def main(args: argparse.Namespace) -> None:
             cfg.train_inference_resize,
             cfg.timing_sync,
             cfg.grad_accumulation_steps,
+            scheduler=scheduler,  # Step-level LR scheduling inside training loop
+            use_amp=cfg.use_amp,
+            scaler=scaler,
             profile_steps=epoch_profile_steps,
             profile_output_dir=epoch_profile_dir,
             profile_start_step=cfg.profile_start_step,
             profile_with_stack=cfg.profile_with_stack,
         )
-        train_stats["lr"] = current_lr
-        logger.info("[Train] Epoch %d done | loss=%.4f", epoch, train_stats["loss"])
+        
+        # LR is now set by train_one_epoch; use end-of-epoch LR for logging
+        end_lr = train_stats.get("lr", optimizer.param_groups[0]["lr"])
+        train_stats["lr"] = end_lr
+        train_stats["lr_start"] = start_lr  # Also track start LR for reference
+        logger.info(
+            "[Train] Epoch %d done | loss=%.4f | lr=%.2e→%.2e",
+            epoch,
+            train_stats["loss"],
+            train_stats.get("lr_start", end_lr),
+            end_lr,
+        )
         msg = (
             "Epoch %d timing (ms): io=%.2f | preprocess=%.2f | forward=%.2f | "
             "loss_fn=%.2f | backward=%.2f | optimizer=%.2f | loss_item=%.2f | interp=%.2f | wall=%.2f"
@@ -1035,6 +1135,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--use-compile",
         action="store_true",
         help="Enable torch.compile (requires PyTorch 2.0+).",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Enable Automatic Mixed Precision (FP16) for faster training on modern GPUs.",
     )
     parser.add_argument(
         "--profile-dir",

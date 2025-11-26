@@ -69,6 +69,9 @@ class TrainConfig:
     # Optional PyTorch 2.x compilation (torch.compile)
     use_compile: bool = False
     timing_sync: bool = True
+    
+    # Automatic Mixed Precision (AMP) for faster training on modern GPUs
+    use_amp: bool = False
 
     # Loss weights (Step 1A defaults)
     lambda_l1: float = 1.0
