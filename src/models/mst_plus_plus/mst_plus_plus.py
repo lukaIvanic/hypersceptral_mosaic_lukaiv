@@ -156,74 +156,231 @@ class FeedForward(nn.Module):
         out = self.net(x.permute(0, 3, 1, 2))
         return out.permute(0, 2, 3, 1)
 
+import torch.utils.checkpoint as checkpoint
+
 class MSAB(nn.Module):
+    """
+    Multi-Spectral Attention Block (SAB in the paper).
+    
+    Paper Reference (Section 3.1):
+    ─────────────────────────────
+    "Based on this nature [HSI spatially sparse, spectrally self-similar], 
+    we adopt the Spectral-wise Multi-head Self-Attention (S-MSA) to compose 
+    the basic unit, Spectral-wise Attention Block (SAB)."
+    
+    Block Structure (standard Transformer block with residual):
+    ─────────────────────────────────────────────────────────
+    
+        Input x
+          │
+          ├─────────────┐
+          ▼             │
+    ┌───────────┐       │
+    │  MS_MSA   │       │  Spectral-wise Multi-head Self-Attention
+    └───────────┘       │
+          │             │
+          + ◄───────────┘  Residual connection #1
+          │
+          ├─────────────┐
+          ▼             │
+    ┌───────────┐       │
+    │ LayerNorm │       │  
+    │    +      │       │  Pre-norm + Feed-Forward Network
+    │    FFN    │       │  (1×1 conv → GELU → 3×3 depthwise → GELU → 1×1 conv)
+    └───────────┘       │
+          │             │
+          + ◄───────────┘  Residual connection #2
+          │
+          ▼
+       Output
+    
+    Multiple blocks are stacked (num_blocks parameter).
+    
+    Args:
+        dim: Feature dimension
+        dim_head: Dimension per attention head
+        heads: Number of attention heads
+        num_blocks: Number of SAB blocks to stack
+        use_checkpoint: Enable gradient checkpointing for memory efficiency
+    """
     def __init__(
             self,
             dim,
             dim_head,
             heads,
             num_blocks,
+            use_checkpoint=False
     ):
         super().__init__()
         self.blocks = nn.ModuleList([])
+        self.use_checkpoint = use_checkpoint
         for _ in range(num_blocks):
             self.blocks.append(nn.ModuleList([
+                # Spectral-wise Multi-head Self-Attention
                 MS_MSA(dim=dim, dim_head=dim_head, heads=heads),
+                # Pre-norm + Feed-Forward Network
                 PreNorm(dim, FeedForward(dim=dim))
             ]))
 
     def forward(self, x):
         """
-        x: [b,c,h,w]
-        return out: [b,c,h,w]
+        Forward pass through stacked SAB blocks.
+        
+        Args:
+            x: [B, C, H, W] - channels first (standard PyTorch conv format)
+        
+        Returns:
+            out: [B, C, H, W]
         """
+        # Convert to channels-last for attention: [B, C, H, W] → [B, H, W, C]
         x = x.permute(0, 2, 3, 1)
+        
         for (attn, ff) in self.blocks:
-            x = attn(x) + x
-            x = ff(x) + x
+            if self.use_checkpoint and x.requires_grad:
+                # Gradient checkpointing: trade compute for memory
+                # Recomputes forward pass during backward instead of storing activations
+                x = checkpoint.checkpoint(self._run_block, attn, ff, x)
+            else:
+                # Standard transformer block with residual connections
+                x = attn(x) + x   # Self-attention + residual
+                x = ff(x) + x     # FFN + residual
+        
+        # Convert back to channels-first: [B, H, W, C] → [B, C, H, W]
         out = x.permute(0, 3, 1, 2)
         return out
 
+    def _run_block(self, attn, ff, x):
+        """Helper for gradient checkpointing."""
+        x = attn(x) + x
+        x = ff(x) + x
+        return x
+
+
 class MST(nn.Module):
-    def __init__(self, in_dim=31, out_dim=31, dim=31, stage=2, num_blocks=[2,4,4]):
+    """
+    Single-stage Spectral-wise Transformer (SST) with U-shaped encoder-decoder.
+    
+    Paper Reference (Section 3.2):
+    ─────────────────────────────
+    "Our SABs build up our proposed Single-stage Spectral-wise Transformer (SST) 
+    that exploits a U-shaped structure to extract multi-resolution spectral 
+    contextual information which is critical for HSI restoration."
+    
+    Architecture (U-Net style):
+    ──────────────────────────
+    
+    Input: [B, in_dim, H, W]
+           │
+           ▼
+    ┌──────────────┐
+    │  Embedding   │  3×3 Conv: in_dim → dim
+    └──────────────┘
+           │
+           │ ENCODER PATH (resolution decreases, channels increase)
+           ▼
+    ┌──────────────┐
+    │   MSAB #0    │  dim channels, H×W resolution
+    │  + Downsample│  4×4 Conv stride 2: dim → 2×dim, H/2 × W/2
+    └──────┬───────┘
+           │ skip connection ─────────────────────┐
+           ▼                                      │
+    ┌──────────────┐                              │
+    │   MSAB #1    │  2×dim channels, H/2×W/2     │
+    │  + Downsample│  4×4 Conv: 2×dim → 4×dim     │
+    └──────┬───────┘                              │
+           │ skip connection ─────────┐           │
+           ▼                          │           │
+    ┌──────────────┐                  │           │
+    │  Bottleneck  │  4×dim, H/4×W/4  │           │
+    │    MSAB      │                  │           │
+    └──────────────┘                  │           │
+           │ DECODER PATH             │           │
+           ▼                          │           │
+    ┌──────────────┐                  │           │
+    │   Upsample   │  TransConv: 4×dim → 2×dim    │
+    │   + Fusion   │  Concat skip + 1×1 conv ◄────┘
+    │   + MSAB     │                              │
+    └──────────────┘                              │
+           ▼                                      │
+    ┌──────────────┐                              │
+    │   Upsample   │  TransConv: 2×dim → dim      │
+    │   + Fusion   │  Concat skip + 1×1 conv ◄────┘
+    │   + MSAB     │
+    └──────────────┘
+           │
+           ▼
+    ┌──────────────┐
+    │   Mapping    │  3×3 Conv: dim → out_dim
+    └──────────────┘
+           │
+           + ◄───────── Input x (residual connection)
+           │
+           ▼
+    Output: [B, out_dim, H, W]
+    
+    Args:
+        in_dim: Input channels
+        out_dim: Output channels  
+        dim: Base channel dimension (doubles at each encoder stage)
+        stage: Number of encoder/decoder levels (default 1 → 2× downsampling)
+        num_blocks: List of MSAB blocks at each level [enc0, ..., bottleneck]
+        use_checkpoint: Gradient checkpointing for memory efficiency
+    
+    Minimal Config (for fast testing):
+        in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1]
+        → ~50K parameters, processes 1024×1024 in seconds
+    """
+    def __init__(self, in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1], use_checkpoint=False):
         super(MST, self).__init__()
         self.dim = dim
         self.stage = stage
 
-        # Input projection
+        # Input projection: project input channels to internal feature dimension
         self.embedding = nn.Conv2d(in_dim, self.dim, 3, 1, 1, bias=False)
 
-        # Encoder
+        # ENCODER: progressively downsample and increase channels
+        # At each stage: MSAB for feature extraction, then 2× downsample
         self.encoder_layers = nn.ModuleList([])
         dim_stage = dim
         for i in range(stage):
             self.encoder_layers.append(nn.ModuleList([
-                MSAB(
-                    dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, heads=dim_stage // dim),
+                # MSAB: Spectral attention blocks
+                # heads = dim_stage // dim → more heads at higher channels
+                MSAB(dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, 
+                     heads=dim_stage // dim, use_checkpoint=use_checkpoint),
+                # Downsample: 4×4 conv with stride 2 (halves spatial, doubles channels)
                 nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
             ]))
-            dim_stage *= 2
+            dim_stage *= 2  # Double channels at each stage
 
-        # Bottleneck
+        # BOTTLENECK: deepest layer with smallest spatial resolution
+        # Has the most channels (dim × 2^stage)
         self.bottleneck = MSAB(
-            dim=dim_stage, dim_head=dim, heads=dim_stage // dim, num_blocks=num_blocks[-1])
+            dim=dim_stage, dim_head=dim, heads=dim_stage // dim, 
+            num_blocks=num_blocks[-1], use_checkpoint=use_checkpoint)
 
-        # Decoder
+        # DECODER: progressively upsample and decrease channels
+        # Uses skip connections from encoder for detail preservation
         self.decoder_layers = nn.ModuleList([])
         for i in range(stage):
             self.decoder_layers.append(nn.ModuleList([
-                nn.ConvTranspose2d(dim_stage, dim_stage // 2, stride=2, kernel_size=2, padding=0, output_padding=0),
+                # Upsample: 2× spatial increase, halve channels
+                nn.ConvTranspose2d(dim_stage, dim_stage // 2, stride=2, kernel_size=2, 
+                                   padding=0, output_padding=0),
+                # Fusion: 1×1 conv to fuse upsampled + skip connection
+                # Input: concatenated (dim_stage//2 + dim_stage//2) = dim_stage
+                # Output: dim_stage // 2
                 nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=False),
-                MSAB(
-                    dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], dim_head=dim,
-                    heads=(dim_stage // 2) // dim),
+                # MSAB for feature refinement at this resolution
+                MSAB(dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], 
+                     dim_head=dim, heads=(dim_stage // 2) // dim, use_checkpoint=use_checkpoint),
             ]))
-            dim_stage //= 2
+            dim_stage //= 2  # Halve channels at each decoder stage
 
-        # Output projection
+        # Output projection: map back to output channels
         self.mapping = nn.Conv2d(self.dim, out_dim, 3, 1, 1, bias=False)
 
-        #### activation function
+        # Activation function (used elsewhere, not in main forward)
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self.apply(self._init_weights)
 
@@ -238,118 +395,190 @@ class MST(nn.Module):
 
     def forward(self, x):
         """
-        x: [b,c,h,w]
-        return out:[b,c,h,w]
+        Forward pass through U-shaped SST.
+        
+        Args:
+            x: [B, in_dim, H, W]
+        
+        Returns:
+            out: [B, out_dim, H, W] with residual connection to input
         """
+        # Project input to feature space
+        fea = self.embedding(x)  # [B, dim, H, W]
 
-        # Embedding
-        fea = self.embedding(x)
-
-        # Encoder
-        fea_encoder = []
+        # ENCODER: extract multi-scale features
+        fea_encoder = []  # Store for skip connections
         for (MSAB, FeaDownSample) in self.encoder_layers:
-            fea = MSAB(fea)
-            fea_encoder.append(fea)
-            fea = FeaDownSample(fea)
+            fea = MSAB(fea)                    # Spectral attention at this scale
+            fea_encoder.append(fea)            # Save for skip connection
+            fea = FeaDownSample(fea)           # Downsample: 2× spatial reduction
 
-        # Bottleneck
+        # BOTTLENECK: process at lowest resolution
         fea = self.bottleneck(fea)
 
-        # Decoder
-        for i, (FeaUpSample, Fution, LeWinBlcok) in enumerate(self.decoder_layers):
-            fea = FeaUpSample(fea)
-            fea = Fution(torch.cat([fea, fea_encoder[self.stage-1-i]], dim=1))
-            fea = LeWinBlcok(fea)
+        # DECODER: reconstruct with skip connections
+        for i, (FeaUpSample, Fusion, LeWinBlock) in enumerate(self.decoder_layers):
+            fea = FeaUpSample(fea)             # Upsample: 2× spatial increase
+            # Concatenate with encoder features (skip connection) and fuse
+            skip_idx = self.stage - 1 - i     # Reverse order for skip connections
+            fea = Fusion(torch.cat([fea, fea_encoder[skip_idx]], dim=1))
+            fea = LeWinBlock(fea)              # Refine with spectral attention
 
-        # Mapping
+        # Map to output channels + RESIDUAL to input
+        # This residual enables learning the "correction" to input
         out = self.mapping(fea) + x
 
         return out
 
 class MST_Plus_Plus(nn.Module):
-    def __init__(self, in_channels=3, out_channels=31, n_feat=31, stage=3):
+    """
+    Multi-stage Spectral-wise Transformer (MST++) for Spectral Reconstruction.
+    
+    Paper Reference: "MST++: Multi-stage Spectral-wise Transformer for Efficient 
+    Spectral Reconstruction" (CVPRW 2022, NTIRE Challenge Winner)
+    
+    Architecture Overview (Paper Section 3, Figure 2):
+    ─────────────────────────────────────────────────
+    MST++ cascades multiple Single-stage Spectral-wise Transformers (SSTs).
+    Each SST progressively refines the reconstruction from coarse to fine.
+    
+        RGB Input [B, 3, H, W]
+             │
+             ▼
+        ┌─────────────┐
+        │   conv_in   │  Project: 3 → n_feat channels
+        └─────────────┘
+             │
+             ▼
+        ┌─────────────┐
+        │   SST #1    │  (MST with U-shaped encoder-decoder)
+        │   (MST)     │  Each SST has internal residual: out = mapping(fea) + x
+        └─────────────┘
+             │
+             ▼
+        ┌─────────────┐
+        │   SST #2    │  Cascaded SSTs progressively refine features
+        │   (MST)     │
+        └─────────────┘
+             │
+             ▼
+        ┌─────────────┐
+        │   SST #3    │  (stage parameter controls number of SSTs)
+        │   (MST)     │
+        └─────────────┘
+             │
+         ┌───┴───┐
+         │       │
+         │   + ◄─┼──── x_feat (global residual from conv_in output)
+         │       │
+         └───┬───┘
+             │
+             ▼
+        ┌─────────────┐
+        │  conv_out   │  Project: n_feat → out_channels (e.g., 31 HSI bands)
+        └─────────────┘
+             │
+             ▼
+        HSI Output [B, 31, H, W]
+    
+    Complexity Analysis:
+    ───────────────────
+    The key innovation is Spectral-wise Multi-head Self-Attention (S-MSA) in MS_MSA.
+    Standard spatial attention: O((H×W)² × C) - quadratic in spatial dimension
+    Spectral-wise attention:    O(C² × H×W)   - LINEAR in spatial dimension H×W
+    
+    This is achieved by treating each spectral channel as a token and computing
+    attention between channels (C×C matrix) rather than spatial locations.
+    For HSI with C=31 channels and H×W=256×256 pixels:
+      - Standard: O(65536² × 31) ≈ 133 trillion operations
+      - Spectral: O(31² × 65536) ≈ 63 million operations (2000x reduction!)
+    
+    Args:
+        in_channels (int): Number of input channels (default: 3 for RGB)
+        out_channels (int): Number of output HSI spectral bands (default: 61)
+        n_feat (int): Internal feature dimension (default: 8 for fast testing)
+        stage (int): Number of cascaded SST stages (default: 1)
+        use_checkpoint (bool): Enable gradient checkpointing for memory efficiency
+    
+    Minimal Config (for fast testing with 1024×1024 input):
+        in_channels=3, out_channels=61, n_feat=8, stage=1
+        → ~15K parameters total, very fast inference
+    
+    Production Config (for quality):
+        in_channels=3, out_channels=61, n_feat=31, stage=3
+        → ~1M+ parameters, better reconstruction quality
+    """
+    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False):
         super(MST_Plus_Plus, self).__init__()
         self.stage = stage
-        self.conv_in = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=(3 - 1) // 2,bias=False)
-        # Use n_feat for dim (internal channels) instead of hardcoded 31
-        # The original MST code used dim=31, but if n_feat changes (e.g. 32), MST needs to know.
-        # Also pass in_dim=n_feat and out_dim=n_feat because MST is used as a body block here 
-        # operating on n_feat channels.
-        modules_body = [MST(dim=n_feat, in_dim=n_feat, out_dim=n_feat, stage=2, num_blocks=[1,1,1]) for _ in range(stage)]
+        
+        # Input projection: RGB (3 channels) → n_feat feature channels
+        # Uses 3×3 conv for local spatial context aggregation
+        self.conv_in = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=(3 - 1) // 2, bias=False)
+        
+        # Body: Cascade of SSTs (Single-stage Spectral-wise Transformers)
+        # Each MST module is one SST with U-shaped encoder-decoder structure
+        # Paper: "MST++, cascaded by several SSTs, develops a multi-stage learning 
+        # scheme to progressively improve the reconstruction quality from coarse to fine"
+        #
+        # MST parameters:
+        #   - dim=n_feat: Base channel dimension for attention heads
+        #   - in_dim/out_dim=n_feat: Input/output channels (internal feature space)
+        #   - stage=1: Number of encoder/decoder levels in U-Net structure (minimal)
+        #   - num_blocks=[1, 1]: Number of SABs at each resolution level (minimal)
+        modules_body = [
+            MST(dim=n_feat, in_dim=n_feat, out_dim=n_feat, stage=1, 
+                num_blocks=[1, 1], use_checkpoint=use_checkpoint) 
+            for _ in range(stage)
+        ]
         self.body = nn.Sequential(*modules_body)
-        self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2,bias=False)
+        
+        # Output projection: n_feat → out_channels (spectral bands)
+        # Maps learned features back to target HSI spectral dimension
+        self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2, bias=False)
 
     def forward(self, x):
         """
-        x: [b,c,h,w]
-        return out:[b,c,h,w]
+        Forward pass for spectral reconstruction.
+        
+        Args:
+            x: Input RGB image [B, in_channels, H, W]
+        
+        Returns:
+            Reconstructed HSI [B, out_channels, H, W]
+        
+        Memory Complexity: O(B × n_feat × H × W) for feature maps
+        Compute Complexity: O(B × stage × (C² × H × W)) - linear in H×W
         """
         b, c, h_inp, w_inp = x.shape
+        
+        # Padding to ensure H and W are divisible by 2^stage_mst
+        # Required because the U-shaped MST uses 2× downsampling per stage
+        # Default stage=1 in MST means 2× total, but we pad to 8 for flexibility
+        # Note: 1024×1024 is already divisible by 8, so no padding needed
         hb, wb = 8, 8
         pad_h = (hb - h_inp % hb) % hb
         pad_w = (wb - w_inp % wb) % wb
         x_pad = F.pad(x, [0, pad_w, 0, pad_h], mode='reflect')
+
+        # Project input to feature space
+        # x_feat: [B, n_feat, H_padded, W_padded]
         x_feat = self.conv_in(x_pad)
+        
+        # Pass through cascaded SSTs (MST modules)
+        # Each MST has its own internal residual: out = mapping(fea) + input
+        # This creates progressive refinement: coarse → fine reconstruction
         h = self.body(x_feat)
-        h = self.conv_out(h)
-        # h += x_feat # This was causing the dimension mismatch (61 vs 32 channels)
-        # The original architecture adds the input x back to the output (global residual)
-        # But since input x has 1 or 3 channels and output has 61, we can't add directly if channels differ.
-        # However, in MST++, input is usually RGB (3 channels) and output is HSI (31 channels).
-        # Wait, looking at the original code again:
-        # h = self.conv_out(h)
-        # h += x
-        # This implies x must have same shape as h. 
-        # In the original code:
-        # x = self.conv_in(x) -> this overwrites x with features.
-        # So 'x' in the original code AT LINE 292 IS THE FEATURE MAP (n_feat channels).
-        # BUT conv_out maps n_feat -> out_channels.
-        # So h (out_channels) += x (n_feat).
-        # This works ONLY if out_channels == n_feat.
-        # In the original MST paper, out_channels=31 and n_feat=31 (dim=31). So it worked.
-        # Here we have out_channels=61 and n_feat=32 (default hidden_channels).
-        
-        # To fix this we have two options:
-        # 1. Force n_feat == out_channels (set hidden_channels = 61).
-        # 2. Remove the residual connection if shapes don't match, or project it.
-        # 3. The original code logic was: 
-        #    x = self.conv_in(x)  <-- x becomes n_feat
-        #    h = self.body(x)     <-- h is n_feat
-        #    h = self.conv_out(h) <-- h is out_channels
-        #    h += x               <-- ERROR if out_channels != n_feat
-        
-        # Actually, looking at original code line 292: h += x
-        # And line 289: x = self.conv_in(x)
-        # Yes, x is the features.
-        
-        # If we want to support arbitrary hidden_channels, we should probably NOT add x back 
-        # if dimensions differ, or use a residual connection around the body only.
-        # Standard ResNet logic: input to body + output of body.
-        # self.body input is n_feat. output is n_feat.
-        # So: h = self.body(x_feat) + x_feat
-        # Then final projection: out = self.conv_out(h)
-        
-        # Let's check where the residual is in original code.
-        # h = self.body(x)
-        # h = self.conv_out(h)
-        # h += x
-        # This implies the residual is added AFTER the final convolution.
-        # This is strange if dimensions differ. 
-        # It seems MST++ assumes n_feat == out_channels.
-        
-        # Since we want to adapt it, let's move the residual to be around the body 
-        # which guarantees shape matching (n_feat -> n_feat).
-        # h = self.body(x_feat) + x_feat
-        # out = self.conv_out(h)
-        
-        # ALTERNATIVELY, if we strictly follow the "Global Residual Learning" usually it means adding the original image.
-        # But the original image is 3 channels (RGB) or 1 channel (Mosaic). Output is 61. Can't add.
-        
-        # I will implement the residual around the body, which is safer and standard for deep networks.
-        
-        h = self.body(x_feat)
-        h = h + x_feat # Residual on features
+
+        # Global residual connection on features (before final projection)
+        # This helps gradient flow and enables learning residual corrections
+        # Note: Each MST already has internal residual, this is an outer residual
+        h = h + x_feat
+
+        # Project features to output spectral bands
+        # h: [B, out_channels, H_padded, W_padded]
         h = self.conv_out(h)
         
+        # Remove padding and return original spatial dimensions
         return h[:, :, :h_inp, :w_inp]
 

@@ -57,16 +57,20 @@ def create_model(
             norm_type=norm_type,
         )
     if variant_norm == "mst_plus_plus":
-        # MST++ uses n_feat instead of hidden_channels conceptually, 
-        # but we can map hidden_channels if provided, or default to 31
-        # The original paper/code uses 31 as default.
-        n_feat = hidden_channels if hidden_channels and hidden_channels > 0 else 31
+        # MST++ uses n_feat instead of hidden_channels conceptually.
+        # For fast testing: n_feat=8, stage=1 (minimal config)
+        # For quality: n_feat=31, stage=3 (paper config)
+        n_feat = hidden_channels if hidden_channels and hidden_channels > 0 else 8  # Default to minimal
+        
+        # Map encoder_depth to MST++ stage (number of cascaded SSTs)
+        # encoder_depth=1 → stage=1 (minimal), encoder_depth=3 → stage=3 (paper)
+        mst_stage = encoder_depth if encoder_depth and encoder_depth > 0 else 1
         
         return MST_Plus_Plus(
             in_channels=in_channels,
             out_channels=out_channels,
             n_feat=n_feat,
-            stage=3 # Default stage from MST++
+            stage=mst_stage,
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite, mst_plus_plus.")
 
