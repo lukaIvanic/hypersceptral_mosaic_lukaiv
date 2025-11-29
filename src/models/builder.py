@@ -28,6 +28,7 @@ def create_model(
     use_bottleneck_attention: bool,
     conv_kernel_size: int,
     norm_type: str,
+    use_raw_input_skip: bool = False,
 ) -> nn.Module:
     variant_norm = variant.lower()
     if variant_norm == "baseline":
@@ -72,6 +73,7 @@ def create_model(
             n_feat=n_feat,
             stage=mst_stage,
             dropout=decoder_dropout,  # Reuse decoder_dropout for MST++ regularization
+            use_raw_input_skip=use_raw_input_skip,
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite, mst_plus_plus.")
 

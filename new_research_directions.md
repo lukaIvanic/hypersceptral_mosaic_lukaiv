@@ -3,11 +3,11 @@
 - [ ] patching e.g. 128x128 for training and inference.
 - [ ] ensemble of models
 - [ ] rotations / test time augmentation for more consistent output
-
+mpl
 - [x] bigger batch sizes, fix validation set being only 2 categories out of 4
 
 
-- [ ] implementing transformers here? (or some other way to give more computing power, for free gains)
+- [x] implementing transformers here? (or some other way to give more computing power, for free gains)
 
 - [ ] dropout didn't prove too useful yet, I think this is because the training/val/test sets are very similar to each other (coming from the same image set data, this is given by the kaggle challenge).
 
@@ -23,7 +23,7 @@
 architectures:
 - [ ] **HSCCN-R/D**
 - [ ] **AWAN**
-- [ ] **MST/MST++**
+- [x] **MST/MST++**
 - [ ] **EDSR-style Residual Networks**
 
 

@@ -292,6 +292,7 @@ def load_model(
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
         norm_type=cfg.norm_type,
+        use_raw_input_skip=cfg.use_raw_input_skip,
     ).to(device)
     model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -373,6 +374,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
     if getattr(args, "use_bottleneck_attention", False):
         cfg.use_bottleneck_attention = True
+    if getattr(args, "use_raw_input_skip", False):
+        cfg.use_raw_input_skip = True
 
     device = torch.device(cfg.device)
 
@@ -756,6 +759,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--use-bottleneck-attention",
         action="store_true",
         help="Enable compact attention in the bottleneck (must match training).",
+    )
+    parser.add_argument(
+        "--use-raw-input-skip",
+        action="store_true",
+        help="MST++: Enable raw input skip connection (must match training).",
     )
     parser.add_argument(
         "--conv-kernel-size",

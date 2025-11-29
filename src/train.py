@@ -634,6 +634,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.spectral_conv_kernel_size = max(1, int(args.spectral_conv_kernel_size))
     if getattr(args, "use_bottleneck_attention", False):
         cfg.use_bottleneck_attention = True
+    if getattr(args, "use_raw_input_skip", False):
+        cfg.use_raw_input_skip = True
     if getattr(args, "conv_kernel_size", None) is not None:
         cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
     if getattr(args, "norm_type", None) is not None:
@@ -812,6 +814,7 @@ def main(args: argparse.Namespace) -> None:
         use_bottleneck_attention=cfg.use_bottleneck_attention,
         conv_kernel_size=cfg.conv_kernel_size,
         norm_type=cfg.norm_type,
+        use_raw_input_skip=cfg.use_raw_input_skip,
     ).to(device)
     if cfg.use_compile:
         if hasattr(torch, "compile"):
@@ -843,6 +846,8 @@ def main(args: argparse.Namespace) -> None:
         getattr(model, "variant_name", cfg.model_variant),
         num_params / 1e6,
     )
+    if cfg.use_raw_input_skip and cfg.model_variant.lower() == "mst_plus_plus":
+        logger.info("[Model] MST++ raw_input_skip enabled (gated skip from raw input to output)")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1371,6 +1376,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--use-bottleneck-attention",
         action="store_true",
         help="Enable compact channel attention in the UNet-lite bottleneck.",
+    )
+    parser.add_argument(
+        "--use-raw-input-skip",
+        action="store_true",
+        help="MST++: Add skip connection from raw input to output for fine spatial detail.",
     )
     parser.add_argument(
         "--conv-kernel-size",

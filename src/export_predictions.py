@@ -86,6 +86,11 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Enable bottleneck attention module (must match training).",
     )
     parser.add_argument(
+        "--use-raw-input-skip",
+        action="store_true",
+        help="MST++: Enable raw input skip connection (must match training).",
+    )
+    parser.add_argument(
         "--conv-kernel-size",
         type=int,
         default=None,
@@ -197,6 +202,8 @@ def export_predictions(args: argparse.Namespace) -> None:
         cfg.stochastic_depth_p = max(0.0, float(args.stochastic_depth_p))
     if args.use_bottleneck_attention:
         cfg.use_bottleneck_attention = True
+    if getattr(args, "use_raw_input_skip", False):
+        cfg.use_raw_input_skip = True
     if args.conv_kernel_size is not None:
         cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
     if args.device is not None:

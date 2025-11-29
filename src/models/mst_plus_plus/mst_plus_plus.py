@@ -517,6 +517,10 @@ class MST_Plus_Plus(nn.Module):
         stage (int): Number of cascaded SST stages (default: 1)
         use_checkpoint (bool): Enable gradient checkpointing for memory efficiency
         dropout (float): Dropout probability in attention/FFN (default: 0.0)
+        use_raw_input_skip (bool): Add skip connection from raw input to output (default: False)
+            This preserves high-frequency spatial detail from the raw mosaic that may be
+            lost during transformer processing. The contribution is gated by a learnable
+            scalar initialized to 0, so it has no effect until trained.
     
     Minimal Config (for fast testing with 1024×1024 input):
         in_channels=3, out_channels=61, n_feat=8, stage=1
@@ -526,10 +530,11 @@ class MST_Plus_Plus(nn.Module):
         in_channels=3, out_channels=61, n_feat=31, stage=3, dropout=0.1
         → ~1M+ parameters, better reconstruction quality
     """
-    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False, dropout=0.0):
+    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False, dropout=0.0, use_raw_input_skip=False):
         super(MST_Plus_Plus, self).__init__()
         self.stage = stage
         self.dropout = dropout
+        self.use_raw_input_skip = use_raw_input_skip
         
         # Input projection: RGB (3 channels) → n_feat feature channels
         # Uses 3×3 conv for local spatial context aggregation
@@ -556,6 +561,24 @@ class MST_Plus_Plus(nn.Module):
         # Output projection: n_feat → out_channels (spectral bands)
         # Maps learned features back to target HSI spectral dimension
         self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2, bias=False)
+        
+        # Optional raw input skip connection
+        # Purpose: Preserve high-frequency spatial detail from raw mosaic
+        # The raw mosaic has fine edges/textures that transformer processing may blur.
+        # This skip provides a direct path for that detail to reach the output.
+        #
+        # Design:
+        #   - raw_skip_proj: Lightweight 3×3 conv projecting raw input → out_channels
+        #   - raw_skip_gate: Learnable scalar initialized to 0 (zero-init for safe training)
+        #
+        # Risks mitigated by zero-init gate:
+        #   - Underdetermined mapping (1 channel → 61 channels) - network learns useful projection
+        #   - Bayer pattern aliasing - gate learns appropriate weighting
+        if use_raw_input_skip:
+            self.raw_skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True)
+            # Zero-initialize the gate so the skip has no effect at start of training
+            # This ensures the model behaves identically to baseline initially
+            self.raw_skip_gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         """
@@ -598,6 +621,13 @@ class MST_Plus_Plus(nn.Module):
         # Project features to output spectral bands
         # h: [B, out_channels, H_padded, W_padded]
         h = self.conv_out(h)
+        
+        # Optional raw input skip connection
+        # Adds gated high-frequency detail from raw mosaic directly to output
+        # Gate is initialized to 0, so no effect until learned
+        if self.use_raw_input_skip:
+            raw_skip = self.raw_skip_proj(x_pad)  # [B, out_channels, H_pad, W_pad]
+            h = h + self.raw_skip_gate * raw_skip
         
         # Remove padding and return original spatial dimensions
         return h[:, :, :h_inp, :w_inp]

@@ -105,6 +105,7 @@ class TrainConfig:
     use_bottleneck_attention: bool = False
     conv_kernel_size: int = 3
     norm_type: str = "group"
+    use_raw_input_skip: bool = False  # MST++: skip from raw input to output for fine detail
 
     # Regularization
     decoder_dropout: float = 0.0
