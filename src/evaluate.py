@@ -222,6 +222,33 @@ def chunked(items: List[Any], size: int):
         yield items[idx : idx + size]
 
 
+def _remap_mst_feedforward_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remap old MST++ FeedForward keys to new format for backward compatibility.
+    
+    Old format (nn.Sequential):  fn.net.0.weight, fn.net.2.weight, fn.net.4.weight
+    New format (individual):     fn.conv1.weight, fn.conv2.weight, fn.conv3.weight
+    """
+    key_map = {
+        ".fn.net.0.": ".fn.conv1.",
+        ".fn.net.2.": ".fn.conv2.",
+        ".fn.net.4.": ".fn.conv3.",
+    }
+    remapped = {}
+    num_remapped = 0
+    for key, value in state_dict.items():
+        new_key = key
+        for old_pattern, new_pattern in key_map.items():
+            if old_pattern in key:
+                new_key = key.replace(old_pattern, new_pattern)
+                num_remapped += 1
+                break
+        remapped[new_key] = value
+    if num_remapped > 0:
+        print(f"[Eval] Remapped {num_remapped} legacy MST++ FeedForward keys for compatibility.")
+    return remapped
+
+
 def load_model(
     ckpt_path: Path,
     cfg: TrainConfig,
@@ -237,6 +264,9 @@ def load_model(
         variant_from_ckpt = raw_state.get("variant")
         epoch_from_ckpt = raw_state.get("epoch")
         state_dict = raw_state.get("model", raw_state)
+    
+    # Remap legacy MST++ FeedForward keys if present
+    state_dict = _remap_mst_feedforward_keys(state_dict)
 
     variant = cfg.model_variant
     if variant_from_ckpt and variant_from_ckpt.lower() != variant.lower():
