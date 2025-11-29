@@ -71,6 +71,7 @@ def create_model(
             out_channels=out_channels,
             n_feat=n_feat,
             stage=mst_stage,
+            dropout=decoder_dropout,  # Reuse decoder_dropout for MST++ regularization
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite, mst_plus_plus.")
 

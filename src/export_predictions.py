@@ -168,6 +168,7 @@ def _resolve_checkpoint(args: argparse.Namespace, model_runs_root: Path) -> Path
     return best_path
 
 
+@torch.no_grad()
 def export_predictions(args: argparse.Namespace) -> None:
     cfg = TrainConfig()
     if args.data_root is not None:

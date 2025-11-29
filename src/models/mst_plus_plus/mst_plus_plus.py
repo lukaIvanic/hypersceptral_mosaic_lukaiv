@@ -138,23 +138,29 @@ class MS_MSA(nn.Module):
         return out
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, mult=4):
+    def __init__(self, dim, mult=4, dropout=0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, dim * mult, 1, 1, bias=False),
-            GELU(),
-            nn.Conv2d(dim * mult, dim * mult, 3, 1, 1, bias=False, groups=dim * mult),
-            GELU(),
-            nn.Conv2d(dim * mult, dim, 1, 1, bias=False),
-        )
+        self.dropout = dropout
+        self.conv1 = nn.Conv2d(dim, dim * mult, 1, 1, bias=False)
+        self.act1 = GELU()
+        self.conv2 = nn.Conv2d(dim * mult, dim * mult, 3, 1, 1, bias=False, groups=dim * mult)
+        self.act2 = GELU()
+        self.conv3 = nn.Conv2d(dim * mult, dim, 1, 1, bias=False)
 
     def forward(self, x):
         """
         x: [b,h,w,c]
         return out: [b,h,w,c]
         """
-        out = self.net(x.permute(0, 3, 1, 2))
-        return out.permute(0, 2, 3, 1)
+        out = x.permute(0, 3, 1, 2)  # [b,c,h,w]
+        out = self.conv1(out)
+        out = self.act1(out)
+        if self.dropout > 0.0:
+            out = F.dropout(out, p=self.dropout, training=self.training)
+        out = self.conv2(out)
+        out = self.act2(out)
+        out = self.conv3(out)
+        return out.permute(0, 2, 3, 1)  # [b,h,w,c]
 
 import torch.utils.checkpoint as checkpoint
 
@@ -202,6 +208,7 @@ class MSAB(nn.Module):
         heads: Number of attention heads
         num_blocks: Number of SAB blocks to stack
         use_checkpoint: Enable gradient checkpointing for memory efficiency
+        dropout: Dropout probability in attention and FFN (default 0.0)
     """
     def __init__(
             self,
@@ -209,17 +216,19 @@ class MSAB(nn.Module):
             dim_head,
             heads,
             num_blocks,
-            use_checkpoint=False
+            use_checkpoint=False,
+            dropout=0.0
     ):
         super().__init__()
         self.blocks = nn.ModuleList([])
         self.use_checkpoint = use_checkpoint
+        self.dropout = dropout
         for _ in range(num_blocks):
             self.blocks.append(nn.ModuleList([
                 # Spectral-wise Multi-head Self-Attention
                 MS_MSA(dim=dim, dim_head=dim_head, heads=heads),
-                # Pre-norm + Feed-Forward Network
-                PreNorm(dim, FeedForward(dim=dim))
+                # Pre-norm + Feed-Forward Network (with dropout)
+                PreNorm(dim, FeedForward(dim=dim, dropout=dropout))
             ]))
 
     def forward(self, x):
@@ -239,11 +248,14 @@ class MSAB(nn.Module):
             if self.use_checkpoint and x.requires_grad:
                 # Gradient checkpointing: trade compute for memory
                 # Recomputes forward pass during backward instead of storing activations
-                x = checkpoint.checkpoint(self._run_block, attn, ff, x)
+                x = checkpoint.checkpoint(self._run_block, attn, ff, x, use_reentrant=False)
             else:
                 # Standard transformer block with residual connections
-                x = attn(x) + x   # Self-attention + residual
-                x = ff(x) + x     # FFN + residual
+                attn_out = attn(x)
+                if self.dropout > 0.0:
+                    attn_out = F.dropout(attn_out, p=self.dropout, training=self.training)
+                x = attn_out + x   # Self-attention + residual
+                x = ff(x) + x      # FFN + residual (FFN has its own dropout)
         
         # Convert back to channels-first: [B, H, W, C] → [B, C, H, W]
         out = x.permute(0, 3, 1, 2)
@@ -251,7 +263,10 @@ class MSAB(nn.Module):
 
     def _run_block(self, attn, ff, x):
         """Helper for gradient checkpointing."""
-        x = attn(x) + x
+        attn_out = attn(x)
+        if self.dropout > 0.0:
+            attn_out = F.dropout(attn_out, p=self.dropout, training=self.training)
+        x = attn_out + x
         x = ff(x) + x
         return x
 
@@ -325,15 +340,17 @@ class MST(nn.Module):
         stage: Number of encoder/decoder levels (default 1 → 2× downsampling)
         num_blocks: List of MSAB blocks at each level [enc0, ..., bottleneck]
         use_checkpoint: Gradient checkpointing for memory efficiency
+        dropout: Dropout probability in attention and FFN (default 0.0)
     
     Minimal Config (for fast testing):
         in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1]
         → ~50K parameters, processes 1024×1024 in seconds
     """
-    def __init__(self, in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1], use_checkpoint=False):
+    def __init__(self, in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1], use_checkpoint=False, dropout=0.0):
         super(MST, self).__init__()
         self.dim = dim
         self.stage = stage
+        self.dropout = dropout
 
         # Input projection: project input channels to internal feature dimension
         self.embedding = nn.Conv2d(in_dim, self.dim, 3, 1, 1, bias=False)
@@ -347,7 +364,7 @@ class MST(nn.Module):
                 # MSAB: Spectral attention blocks
                 # heads = dim_stage // dim → more heads at higher channels
                 MSAB(dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, 
-                     heads=dim_stage // dim, use_checkpoint=use_checkpoint),
+                     heads=dim_stage // dim, use_checkpoint=use_checkpoint, dropout=dropout),
                 # Downsample: 4×4 conv with stride 2 (halves spatial, doubles channels)
                 nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
             ]))
@@ -357,7 +374,7 @@ class MST(nn.Module):
         # Has the most channels (dim × 2^stage)
         self.bottleneck = MSAB(
             dim=dim_stage, dim_head=dim, heads=dim_stage // dim, 
-            num_blocks=num_blocks[-1], use_checkpoint=use_checkpoint)
+            num_blocks=num_blocks[-1], use_checkpoint=use_checkpoint, dropout=dropout)
 
         # DECODER: progressively upsample and decrease channels
         # Uses skip connections from encoder for detail preservation
@@ -373,7 +390,7 @@ class MST(nn.Module):
                 nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=False),
                 # MSAB for feature refinement at this resolution
                 MSAB(dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], 
-                     dim_head=dim, heads=(dim_stage // 2) // dim, use_checkpoint=use_checkpoint),
+                     dim_head=dim, heads=(dim_stage // 2) // dim, use_checkpoint=use_checkpoint, dropout=dropout),
             ]))
             dim_stage //= 2  # Halve channels at each decoder stage
 
@@ -499,18 +516,20 @@ class MST_Plus_Plus(nn.Module):
         n_feat (int): Internal feature dimension (default: 8 for fast testing)
         stage (int): Number of cascaded SST stages (default: 1)
         use_checkpoint (bool): Enable gradient checkpointing for memory efficiency
+        dropout (float): Dropout probability in attention/FFN (default: 0.0)
     
     Minimal Config (for fast testing with 1024×1024 input):
         in_channels=3, out_channels=61, n_feat=8, stage=1
         → ~15K parameters total, very fast inference
     
     Production Config (for quality):
-        in_channels=3, out_channels=61, n_feat=31, stage=3
+        in_channels=3, out_channels=61, n_feat=31, stage=3, dropout=0.1
         → ~1M+ parameters, better reconstruction quality
     """
-    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False):
+    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False, dropout=0.0):
         super(MST_Plus_Plus, self).__init__()
         self.stage = stage
+        self.dropout = dropout
         
         # Input projection: RGB (3 channels) → n_feat feature channels
         # Uses 3×3 conv for local spatial context aggregation
@@ -526,9 +545,10 @@ class MST_Plus_Plus(nn.Module):
         #   - in_dim/out_dim=n_feat: Input/output channels (internal feature space)
         #   - stage=1: Number of encoder/decoder levels in U-Net structure (minimal)
         #   - num_blocks=[1, 1]: Number of SABs at each resolution level (minimal)
+        #   - dropout: Regularization in attention and FFN
         modules_body = [
             MST(dim=n_feat, in_dim=n_feat, out_dim=n_feat, stage=1, 
-                num_blocks=[1, 1], use_checkpoint=use_checkpoint) 
+                num_blocks=[1, 1], use_checkpoint=use_checkpoint, dropout=dropout) 
             for _ in range(stage)
         ]
         self.body = nn.Sequential(*modules_body)
