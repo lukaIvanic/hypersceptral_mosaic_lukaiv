@@ -32,6 +32,102 @@ from .utils.metrics.storage import (
     utc_timestamp,
 )
 
+import shutil
+
+
+def fix_best_checkpoint(run_dir: Path, loss_key: str = "loss", dry_run: bool = False) -> bool:
+    """
+    Check if model_best.pt corresponds to the epoch with lowest loss in metrics.json.
+    If not, copy the correct epoch checkpoint to model_best.pt.
+    
+    This is useful when loss weights change mid-training, making earlier losses
+    incomparable to later ones. After manually adjusting metrics.json, run this
+    to sync model_best.pt with the actual best epoch.
+    
+    Args:
+        run_dir: Path to the run directory containing checkpoints/ and metrics/
+        loss_key: Which metric key to use for finding the best epoch (default: "loss")
+        dry_run: If True, only report what would be done without making changes
+    
+    Returns:
+        True if model_best.pt was updated (or would be updated in dry_run mode)
+    """
+    ckpt_dir = run_dir / "checkpoints"
+    metrics_path = run_dir / "metrics" / "metrics.json"
+    best_ckpt = ckpt_dir / "model_best.pt"
+    
+    if not metrics_path.exists():
+        print(f"[FixBest] No metrics.json found at {metrics_path}")
+        return False
+    
+    if not best_ckpt.exists():
+        print(f"[FixBest] No model_best.pt found at {best_ckpt}")
+        return False
+    
+    # Load metrics history
+    history = load_metrics_history(metrics_path)
+    if not history:
+        print("[FixBest] metrics.json is empty")
+        return False
+    
+    # Find epoch with minimum loss
+    best_epoch = None
+    best_loss = float("inf")
+    for record in history:
+        epoch = record.get("epoch")
+        # Look for loss in val section first, then val_native
+        val_data = record.get("val") or record.get("val_native") or {}
+        loss_val = val_data.get(loss_key)
+        if loss_val is not None and loss_val < best_loss:
+            best_loss = loss_val
+            best_epoch = epoch
+    
+    if best_epoch is None:
+        print(f"[FixBest] Could not find any epoch with '{loss_key}' in metrics.json")
+        return False
+    
+    # Check current model_best.pt epoch
+    try:
+        raw_state = torch.load(best_ckpt, map_location="cpu")
+        current_best_epoch = raw_state.get("epoch") if isinstance(raw_state, dict) else None
+    except Exception as exc:
+        print(f"[FixBest] Failed to load model_best.pt: {exc}")
+        return False
+    
+    if current_best_epoch == best_epoch:
+        print(f"[FixBest] model_best.pt already corresponds to best epoch {best_epoch} (loss={best_loss:.6f})")
+        return False
+    
+    # Find the checkpoint for the best epoch
+    source_ckpt = ckpt_dir / f"model_epoch_{best_epoch:03d}.pt"
+    if not source_ckpt.exists():
+        # Try without zero-padding
+        source_ckpt = ckpt_dir / f"model_epoch_{best_epoch}.pt"
+    if not source_ckpt.exists():
+        print(f"[FixBest] Cannot find checkpoint for epoch {best_epoch}")
+        return False
+    
+    # Report and optionally fix
+    print(
+        f"[FixBest] Best epoch is {best_epoch} (loss={best_loss:.6f}), "
+        f"but model_best.pt is from epoch {current_best_epoch}"
+    )
+    
+    if dry_run:
+        print(f"[FixBest] DRY RUN: Would copy {source_ckpt.name} -> model_best.pt")
+    else:
+        # Backup old best
+        backup_path = ckpt_dir / f"model_best_backup_epoch{current_best_epoch}.pt"
+        if not backup_path.exists():
+            shutil.copy2(best_ckpt, backup_path)
+            print(f"[FixBest] Backed up old model_best.pt to {backup_path.name}")
+        
+        # Copy the correct checkpoint
+        shutil.copy2(source_ckpt, best_ckpt)
+        print(f"[FixBest] Copied {source_ckpt.name} -> model_best.pt")
+    
+    return True
+
 
 @dataclass
 class EvaluationAccumulator:
@@ -403,6 +499,17 @@ def main(args: argparse.Namespace) -> None:
     model_runs_root = Path(__file__).resolve().parent / "models" / "simple_cnn" / "runs"
     run_dir: Path | None = model_runs_root / cfg.run_name if args.run_name is not None else None
 
+    # Handle --fix-best-checkpoint / --fix-best-dry-run before loading checkpoints
+    fix_best = getattr(args, "fix_best_checkpoint", False)
+    fix_best_dry = getattr(args, "fix_best_dry_run", False)
+    if (fix_best or fix_best_dry) and run_dir is not None:
+        fixed = fix_best_checkpoint(run_dir, dry_run=fix_best_dry)
+        if fix_best_dry and fixed:
+            print("[Eval] Dry run complete. Use --fix-best-checkpoint to apply changes.")
+            return
+        elif fix_best and not fixed:
+            print("[Eval] No changes needed to model_best.pt.")
+
     checkpoint_jobs: List[Tuple[Path, bool]] = []
     max_checkpoints = args.max_checkpoints if args.max_checkpoints and args.max_checkpoints > 0 else None
 
@@ -651,6 +758,16 @@ def main(args: argparse.Namespace) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a Track 1 checkpoint")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (.pt). If omitted, uses --run-name/model_best.pt")
+    parser.add_argument(
+        "--fix-best-checkpoint",
+        action="store_true",
+        help="Check metrics.json and update model_best.pt if it doesn't match the actual best epoch.",
+    )
+    parser.add_argument(
+        "--fix-best-dry-run",
+        action="store_true",
+        help="Like --fix-best-checkpoint but only reports what would be done.",
+    )
     parser.add_argument(
         "--all-checkpoints",
         action="store_true",
