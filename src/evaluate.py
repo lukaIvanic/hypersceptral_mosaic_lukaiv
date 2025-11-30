@@ -18,6 +18,7 @@ from .losses import CompositeSpectralLoss, LossWeights
 from .metrics import aggregate, list_available_metrics
 from .models.builder import create_model
 from .utils.inference import run_model_with_resize
+from .utils.tta import Transform, apply_tta, resolve_tta_mode, identity
 from .utils.metrics.schema import (
     ACCURACY_METRIC_UNITS,
     SOURCE_EVALUATE,
@@ -194,9 +195,14 @@ def run_multi_evaluation(
     progress_updates: int = 5,
     inference_resize: int | None = None,
     upsample_metrics: bool = False,
+    tta_transforms: List[Transform] | None = None,
 ) -> None:
     if not accumulators:
         return
+    
+    # Default to no TTA (single identity transform)
+    if tta_transforms is None:
+        tta_transforms = [identity]
 
     loader = DataLoader(dataset, **loader_kwargs)
     total_batches = len(loader)
@@ -243,9 +249,11 @@ def run_multi_evaluation(
             if device_type == "cuda":
                 torch.cuda.synchronize(device)
             infer_start = time.perf_counter()
-            preds = run_model_with_resize(
+            # Apply TTA: run model on augmented inputs, inverse-transform, average
+            preds = apply_tta(
                 accumulator.model,
                 inputs,
+                tta_transforms,
                 inference_resize,
                 target_shape if upsample_metrics else None,
             )
@@ -647,6 +655,13 @@ def main(args: argparse.Namespace) -> None:
     )
     print(f"[Eval] Checkpoints queued: {len(checkpoint_jobs)}")
 
+    # Resolve TTA mode
+    tta_mode = getattr(args, "tta_mode", "none") or "none"
+    tta_include_rot90 = getattr(args, "tta_include_rot90", False)
+    resolved_tta_mode, tta_transforms = resolve_tta_mode(tta_mode, tta_include_rot90)
+    num_tta_passes = len(tta_transforms)
+    print(f"[Eval] TTA mode: {resolved_tta_mode} ({num_tta_passes} forward pass{'es' if num_tta_passes > 1 else ''})")
+
     parallel_limit = args.max_parallel_checkpoints or len(checkpoint_jobs)
     parallel_limit = max(1, min(parallel_limit, len(checkpoint_jobs)))
     total_chunks = (len(checkpoint_jobs) + parallel_limit - 1) // parallel_limit
@@ -693,6 +708,7 @@ def main(args: argparse.Namespace) -> None:
             progress_updates=args.progress_updates,
             inference_resize=inference_resize,
             upsample_metrics=upsample_metrics,
+            tta_transforms=tta_transforms,
         )
         for accumulator in accumulators:
             evaluation_results.append((accumulator, accumulator.finalize()))
@@ -789,6 +805,25 @@ def build_argparser() -> argparse.ArgumentParser:
         "--upsample-metrics",
         action="store_true",
         help="Run the model at the training resolution but upsample predictions back to native size before computing metrics.",
+    )
+    parser.add_argument(
+        "--tta-mode",
+        type=str,
+        default="none",
+        choices=("none", "flip", "rotate90", "dihedral", "auto"),
+        help=(
+            "Test-time augmentation mode. "
+            "none=disabled (1 pass), "
+            "flip=H/V flips (4 passes), "
+            "rotate90=90° rotations (4 passes), "
+            "dihedral=flips+rotations (8 passes), "
+            "auto=flip by default, dihedral if --tta-include-rot90."
+        ),
+    )
+    parser.add_argument(
+        "--tta-include-rot90",
+        action="store_true",
+        help="When --tta-mode=auto, upgrade from flip to dihedral (matches --aug-rotate90 training).",
     )
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)

@@ -13,6 +13,7 @@ from .config import TrainConfig
 from .data import Track1Dataset
 from .evaluate import load_model
 from .utils.inference import run_model_with_resize
+from .utils.tta import apply_tta, resolve_tta_mode
 
 
 def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -152,6 +153,25 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Transpose predictions before saving so output shape becomes (W, H, C) instead of (H, W, C).",
     )
+    parser.add_argument(
+        "--tta-mode",
+        type=str,
+        default="none",
+        choices=("none", "flip", "rotate90", "dihedral", "auto"),
+        help=(
+            "Test-time augmentation mode. "
+            "none=disabled (1 pass), "
+            "flip=H/V flips (4 passes), "
+            "rotate90=90° rotations (4 passes), "
+            "dihedral=flips+rotations (8 passes), "
+            "auto=flip by default, dihedral if --tta-include-rot90."
+        ),
+    )
+    parser.add_argument(
+        "--tta-include-rot90",
+        action="store_true",
+        help="When --tta-mode=auto, upgrade from flip to dihedral (matches --aug-rotate90 training).",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -258,6 +278,13 @@ def export_predictions(args: argparse.Namespace) -> None:
         f"for split='{args.split}' | samples={total_images} | device={device}"
     )
 
+    # Resolve TTA mode
+    tta_mode = getattr(args, "tta_mode", "none") or "none"
+    tta_include_rot90 = getattr(args, "tta_include_rot90", False)
+    resolved_tta_mode, tta_transforms = resolve_tta_mode(tta_mode, tta_include_rot90)
+    num_tta_passes = len(tta_transforms)
+    print(f"[Export] TTA mode: {resolved_tta_mode} ({num_tta_passes} forward pass{'es' if num_tta_passes > 1 else ''})")
+
     processed = 0
     skipped = 0
     for batch_idx, batch in enumerate(loader, start=1):
@@ -267,7 +294,8 @@ def export_predictions(args: argparse.Namespace) -> None:
             ids = [ids]
 
         final_shape = tuple(int(dim) for dim in mosaics.shape[-2:])
-        preds = run_model_with_resize(model, mosaics, inference_resize, final_shape)
+        # Apply TTA: run model on augmented inputs, inverse-transform, average
+        preds = apply_tta(model, mosaics, tta_transforms, inference_resize, final_shape)
         preds = preds.detach().clamp_(0.0, 1.0).cpu()
 
         for sample_idx, sample_id in enumerate(ids):
