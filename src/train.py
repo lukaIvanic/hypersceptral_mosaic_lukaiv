@@ -152,6 +152,26 @@ class WarmupCosineScheduler:
     def get_current_step(self) -> int:
         return self._current_step
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return scheduler state for checkpointing."""
+        return {
+            "current_step": self._current_step,
+            "last_lr": self._last_lr,
+            "base_lr": self.base_lr,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "warmup_start_factor": self.warmup_start_factor,
+            "eta_min": self.eta_min,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore scheduler state from checkpoint."""
+        self._current_step = state.get("current_step", 0)
+        self._last_lr = state.get("last_lr", self.base_lr)
+        # Apply the restored LR immediately
+        for group in self.optimizer.param_groups:
+            group["lr"] = self._last_lr
+
 
 def create_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -496,6 +516,7 @@ def save_checkpoint(
     epoch: int,
     path: Path,
     model_variant: str | None = None,
+    scheduler: Optional[WarmupCosineScheduler] = None,
 ) -> None:
     state = {
         "epoch": epoch,
@@ -503,6 +524,8 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "variant": model_variant or getattr(model, "variant_name", None),
     }
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     torch.save(state, path)
     logger.info("[Checkpoint] Saved to %s", path)
 
@@ -938,6 +961,32 @@ def main(args: argparse.Namespace) -> None:
                         "[Resume] Optimizer state mismatch (%s); starting with fresh optimizer state.",
                         exc,
                     )
+            # Restore scheduler state if available
+            scheduler_state = checkpoint.get("scheduler")
+            if scheduler_state is not None and scheduler is not None:
+                try:
+                    scheduler.load_state_dict(scheduler_state)
+                    logger.info(
+                        "[Resume] Restored scheduler state (step=%d, lr=%.2e)",
+                        scheduler.get_current_step(),
+                        scheduler.get_last_lr(),
+                    )
+                except (ValueError, KeyError) as exc:
+                    logger.warning(
+                        "[Resume] Scheduler state mismatch (%s); starting with fresh scheduler.",
+                        exc,
+                    )
+            elif scheduler is not None:
+                # No scheduler state in checkpoint - fast-forward to correct step
+                # This handles old checkpoints that didn't save scheduler state
+                saved_epoch = int(checkpoint.get("epoch", last_ckpt_epoch))
+                target_step = saved_epoch * steps_per_epoch
+                logger.warning(
+                    "[Resume] No scheduler state in checkpoint; fast-forwarding to step %d",
+                    target_step,
+                )
+                for _ in range(target_step):
+                    scheduler.step()
             saved_epoch = int(checkpoint.get("epoch", last_ckpt_epoch))
             start_epoch = saved_epoch + 1
             logger.info(
@@ -1078,6 +1127,7 @@ def main(args: argparse.Namespace) -> None:
                     epoch,
                     ckpt_dir / "model_best.pt",
                     cfg.model_variant,
+                    scheduler,
                 )
 
         if epoch % cfg.checkpoint_every == 0:
@@ -1087,6 +1137,7 @@ def main(args: argparse.Namespace) -> None:
                 epoch,
                 ckpt_dir / f"model_epoch_{epoch:03d}.pt",
                 cfg.model_variant,
+                scheduler,
             )
 
         # Update metrics history log
