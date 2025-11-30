@@ -561,6 +561,8 @@ def main(args: argparse.Namespace) -> None:
         cfg.val_crop_overlap = float(args.val_crop_overlap)
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if getattr(args, "val_interval", None) is not None:
+        cfg.val_interval = max(1, int(args.val_interval))
     if args.learning_rate is not None:
         cfg.learning_rate = args.learning_rate
     if args.weight_decay is not None:
@@ -1198,6 +1200,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--hidden-channels", type=int, default=None)
+    parser.add_argument(
+        "--val-interval",
+        type=int,
+        default=None,
+        help="Run validation every N epochs (default 1).",
+    )
     parser.add_argument(
         "--mst-internal-depth",
         type=int,
