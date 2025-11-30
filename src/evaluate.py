@@ -409,6 +409,117 @@ def load_model(
     return model, info
 
 
+class EnsembleModel(nn.Module):
+    """
+    Wrapper that holds multiple models and averages their predictions.
+    
+    All ensemble members must have the same architecture and input/output shapes.
+    Predictions are averaged element-wise across all members.
+    """
+    
+    def __init__(self, models: List[nn.Module]):
+        super().__init__()
+        if not models:
+            raise ValueError("EnsembleModel requires at least one model.")
+        self.models = nn.ModuleList(models)
+        self.num_models = len(models)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run all models and average predictions."""
+        # Run first model to get output shape
+        preds = self.models[0](x)
+        
+        # Accumulate predictions from remaining models
+        for model in self.models[1:]:
+            preds = preds + model(x)
+        
+        # Average
+        return preds / self.num_models
+    
+    def eval(self):
+        """Set all models to eval mode."""
+        for model in self.models:
+            model.eval()
+        return super().eval()
+    
+    def train(self, mode: bool = True):
+        """Set all models to train mode (usually not needed for ensemble inference)."""
+        for model in self.models:
+            model.train(mode)
+        return super().train(mode)
+
+
+def load_ensemble_models(
+    checkpoint_paths: List[Path],
+    cfg: TrainConfig,
+    device: torch.device,
+    *,
+    strict: bool = True,
+) -> Tuple[EnsembleModel, Dict[str, Any]]:
+    """
+    Load multiple checkpoints and wrap them in an EnsembleModel.
+    
+    All checkpoints must be the same architecture variant.
+    
+    Args:
+        checkpoint_paths: List of paths to checkpoint files.
+        cfg: Training configuration (used for model architecture).
+        device: Device to load models on.
+        strict: Whether to strictly enforce state_dict matching.
+    
+    Returns:
+        Tuple of (EnsembleModel, info_dict) where info_dict contains
+        metadata about the loaded ensemble.
+    """
+    if not checkpoint_paths:
+        raise ValueError("At least one checkpoint path is required for ensemble.")
+    
+    models: List[nn.Module] = []
+    epochs: List[int | None] = []
+    loaded_variant: str | None = None
+    
+    for idx, ckpt_path in enumerate(checkpoint_paths):
+        model_cfg = copy.deepcopy(cfg)
+        model, info = load_model(ckpt_path, model_cfg, device, strict=strict)
+        
+        # Verify all models have the same variant
+        this_variant = info.get("loaded_variant", cfg.model_variant)
+        if loaded_variant is None:
+            loaded_variant = this_variant
+        elif this_variant.lower() != loaded_variant.lower():
+            raise ValueError(
+                f"Ensemble checkpoint {idx + 1} has variant '{this_variant}' "
+                f"but expected '{loaded_variant}'. All ensemble members must be the same architecture."
+            )
+        
+        models.append(model)
+        epochs.append(info.get("epoch"))
+        
+        num_params = sum(p.numel() for p in model.parameters())
+        print(
+            f"[Ensemble] Loaded member {idx + 1}/{len(checkpoint_paths)}: "
+            f"{ckpt_path.name} ({num_params / 1e6:.2f}M params)"
+        )
+    
+    ensemble = EnsembleModel(models)
+    ensemble.eval()
+    
+    # Compute total params (same architecture, so just multiply)
+    total_params = sum(p.numel() for p in ensemble.parameters())
+    print(
+        f"[Ensemble] Created ensemble with {len(models)} members | "
+        f"total params: {total_params / 1e6:.2f}M"
+    )
+    
+    info: Dict[str, Any] = {
+        "epoch": epochs,
+        "num_members": len(models),
+        "loaded_variant": loaded_variant,
+        "checkpoint_paths": [str(p) for p in checkpoint_paths],
+    }
+    return ensemble, info
+
+
 def main(args: argparse.Namespace) -> None:
     cfg = TrainConfig()
     default_resize = cfg.resize_to
@@ -518,6 +629,28 @@ def main(args: argparse.Namespace) -> None:
         elif fix_best and not fixed:
             print("[Eval] No changes needed to model_best.pt.")
 
+    # Check for ensemble mode
+    ensemble_checkpoints_arg = getattr(args, "ensemble_checkpoints", None)
+    use_ensemble = ensemble_checkpoints_arg is not None and ensemble_checkpoints_arg.strip()
+    
+    if use_ensemble:
+        # Parse comma-separated checkpoint paths
+        ensemble_paths = [
+            Path(p.strip()).expanduser().resolve()
+            for p in ensemble_checkpoints_arg.split(",")
+            if p.strip()
+        ]
+        if len(ensemble_paths) < 2:
+            raise ValueError("--ensemble-checkpoints requires at least 2 comma-separated checkpoint paths.")
+        for p in ensemble_paths:
+            if not p.exists():
+                raise FileNotFoundError(f"Ensemble checkpoint not found: {p}")
+        # Validate incompatible flags
+        if args.checkpoint is not None:
+            raise ValueError("--ensemble-checkpoints cannot be combined with --checkpoint.")
+        if getattr(args, "all_checkpoints", False):
+            raise ValueError("--ensemble-checkpoints cannot be combined with --all-checkpoints.")
+
     checkpoint_jobs: List[Tuple[Path, bool]] = []
     max_checkpoints = args.max_checkpoints if args.max_checkpoints and args.max_checkpoints > 0 else None
 
@@ -553,7 +686,7 @@ def main(args: argparse.Namespace) -> None:
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Pass --checkpoint explicitly.")
             checkpoint_jobs.append((ckpt_path, True))
 
-    if not checkpoint_jobs:
+    if not checkpoint_jobs and not use_ensemble:
         raise RuntimeError("No checkpoints selected for evaluation.")
 
     if max_checkpoints is not None and len(checkpoint_jobs) > max_checkpoints:
@@ -653,7 +786,10 @@ def main(args: argparse.Namespace) -> None:
         f"lambda_srgb_l1={cfg.lambda_srgb_l1:.3f} | "
         f"lambda_srgb_ssim={cfg.lambda_srgb_ssim:.3f}"
     )
-    print(f"[Eval] Checkpoints queued: {len(checkpoint_jobs)}")
+    if use_ensemble:
+        print(f"[Eval] Ensemble mode: {len(ensemble_paths)} checkpoints")
+    else:
+        print(f"[Eval] Checkpoints queued: {len(checkpoint_jobs)}")
 
     # Resolve TTA mode
     tta_mode = getattr(args, "tta_mode", "none") or "none"
@@ -662,42 +798,31 @@ def main(args: argparse.Namespace) -> None:
     num_tta_passes = len(tta_transforms)
     print(f"[Eval] TTA mode: {resolved_tta_mode} ({num_tta_passes} forward pass{'es' if num_tta_passes > 1 else ''})")
 
-    parallel_limit = args.max_parallel_checkpoints or len(checkpoint_jobs)
-    parallel_limit = max(1, min(parallel_limit, len(checkpoint_jobs)))
-    total_chunks = (len(checkpoint_jobs) + parallel_limit - 1) // parallel_limit
-
     evaluation_results: List[Tuple[EvaluationAccumulator, Dict[str, float]]] = []
-    for chunk_index, chunk in enumerate(chunked(checkpoint_jobs, parallel_limit), start=1):
-        if total_chunks > 1:
-            print(
-                f"[Eval] Processing checkpoint chunk {chunk_index}/{total_chunks} "
-                f"({len(chunk)} checkpoint(s))"
+    
+    if use_ensemble:
+        # Ensemble evaluation: load all models, wrap in EnsembleModel, evaluate once
+        ensemble_model, ensemble_info = load_ensemble_models(ensemble_paths, cfg, device)
+        
+        # Create label for ensemble
+        epochs = ensemble_info.get("epoch", [])
+        epoch_strs = [str(e) if e is not None else "?" for e in epochs]
+        label = f"ensemble-{len(ensemble_paths)}x (epochs: {', '.join(epoch_strs)})"
+        
+        # Use first checkpoint path for metrics logging reference
+        first_ckpt_path = ensemble_paths[0]
+        
+        accumulators = [
+            EvaluationAccumulator(
+                label=label,
+                epoch=None,  # Ensemble doesn't have a single epoch
+                checkpoint_path=first_ckpt_path,
+                model=ensemble_model,
+                metric_names=metrics_requested,
+                is_best=False,
             )
-
-        accumulators: List[EvaluationAccumulator] = []
-        for ckpt_path, is_best in chunk:
-            model_cfg = copy.deepcopy(cfg)
-            model, info = load_model(ckpt_path, model_cfg, device)
-            epoch_from_state = info.get("epoch")
-            epoch = epoch_from_state if epoch_from_state is not None else infer_epoch_from_path(ckpt_path)
-            label = f"epoch-{epoch:03d}" if epoch is not None else ckpt_path.stem
-            if is_best:
-                label = f"best (ep {epoch})" if epoch is not None else "best"
-            num_params = sum(p.numel() for p in model.parameters())
-            print(
-                f"[Eval] Loaded {ckpt_path.name}: {num_params / 1e6:.2f}M params | label={label}"
-            )
-            accumulators.append(
-                EvaluationAccumulator(
-                    label=label,
-                    epoch=epoch,
-                    checkpoint_path=ckpt_path,
-                    model=model,
-                    metric_names=metrics_requested,
-                    is_best=is_best,
-                )
-            )
-
+        ]
+        
         run_multi_evaluation(
             accumulators,
             dataset,
@@ -712,6 +837,57 @@ def main(args: argparse.Namespace) -> None:
         )
         for accumulator in accumulators:
             evaluation_results.append((accumulator, accumulator.finalize()))
+    else:
+        # Standard checkpoint evaluation
+        parallel_limit = args.max_parallel_checkpoints or len(checkpoint_jobs)
+        parallel_limit = max(1, min(parallel_limit, len(checkpoint_jobs)))
+        total_chunks = (len(checkpoint_jobs) + parallel_limit - 1) // parallel_limit
+
+        for chunk_index, chunk in enumerate(chunked(checkpoint_jobs, parallel_limit), start=1):
+            if total_chunks > 1:
+                print(
+                    f"[Eval] Processing checkpoint chunk {chunk_index}/{total_chunks} "
+                    f"({len(chunk)} checkpoint(s))"
+                )
+
+            accumulators: List[EvaluationAccumulator] = []
+            for ckpt_path, is_best in chunk:
+                model_cfg = copy.deepcopy(cfg)
+                model, info = load_model(ckpt_path, model_cfg, device)
+                epoch_from_state = info.get("epoch")
+                epoch = epoch_from_state if epoch_from_state is not None else infer_epoch_from_path(ckpt_path)
+                label = f"epoch-{epoch:03d}" if epoch is not None else ckpt_path.stem
+                if is_best:
+                    label = f"best (ep {epoch})" if epoch is not None else "best"
+                num_params = sum(p.numel() for p in model.parameters())
+                print(
+                    f"[Eval] Loaded {ckpt_path.name}: {num_params / 1e6:.2f}M params | label={label}"
+                )
+                accumulators.append(
+                    EvaluationAccumulator(
+                        label=label,
+                        epoch=epoch,
+                        checkpoint_path=ckpt_path,
+                        model=model,
+                        metric_names=metrics_requested,
+                        is_best=is_best,
+                    )
+                )
+
+            run_multi_evaluation(
+                accumulators,
+                dataset,
+                loader_kwargs,
+                device,
+                loss_fn,
+                metrics_requested,
+                progress_updates=args.progress_updates,
+                inference_resize=inference_resize,
+                upsample_metrics=upsample_metrics,
+                tta_transforms=tta_transforms,
+            )
+            for accumulator in accumulators:
+                evaluation_results.append((accumulator, accumulator.finalize()))
 
     summary_order = ["loss"] + [name for name in metrics_requested if name != "loss"]
     print("[Eval] Completed evaluation.")
@@ -774,6 +950,16 @@ def main(args: argparse.Namespace) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a Track 1 checkpoint")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (.pt). If omitted, uses --run-name/model_best.pt")
+    parser.add_argument(
+        "--ensemble-checkpoints",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated paths to checkpoints for ensemble inference. "
+            "When set, predictions are averaged across all models. "
+            "All checkpoints must be the same architecture variant."
+        ),
+    )
     parser.add_argument(
         "--fix-best-checkpoint",
         action="store_true",

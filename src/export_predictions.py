@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from .config import TrainConfig
 from .data import Track1Dataset
-from .evaluate import load_model
+from .evaluate import load_model, load_ensemble_models
 from .utils.inference import run_model_with_resize
 from .utils.tta import apply_tta, resolve_tta_mode
 
@@ -27,6 +27,16 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=None, help="Dataset root (defaults to TrainConfig.data_root).")
     parser.add_argument("--run-name", type=str, default=None, help="Training run name whose checkpoints should be used.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Explicit checkpoint path to load instead of run-name default.")
+    parser.add_argument(
+        "--ensemble-checkpoints",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated paths to checkpoints for ensemble inference. "
+            "When set, predictions are averaged across all models. "
+            "All checkpoints must be the same architecture variant."
+        ),
+    )
     parser.add_argument("--model-variant", type=str, default=None, help="Model variant override (e.g. unet_lite).")
     parser.add_argument("--hidden-channels", type=int, default=None, help="Hidden channel width for baseline variant.")
     parser.add_argument(
@@ -245,10 +255,34 @@ def export_predictions(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_runs_root = Path(__file__).resolve().parent / "models" / "simple_cnn" / "runs"
-    checkpoint_path = _resolve_checkpoint(args, model_runs_root)
-
     strict = not args.allow_partial
-    model, ckpt_info = load_model(checkpoint_path, cfg, device, strict=strict)
+    
+    # Check for ensemble mode
+    ensemble_checkpoints_arg = getattr(args, "ensemble_checkpoints", None)
+    use_ensemble = ensemble_checkpoints_arg is not None and ensemble_checkpoints_arg.strip()
+    
+    if use_ensemble:
+        # Parse comma-separated checkpoint paths
+        ensemble_paths = [
+            Path(p.strip()).expanduser().resolve()
+            for p in ensemble_checkpoints_arg.split(",")
+            if p.strip()
+        ]
+        if len(ensemble_paths) < 2:
+            raise ValueError("--ensemble-checkpoints requires at least 2 comma-separated checkpoint paths.")
+        for p in ensemble_paths:
+            if not p.exists():
+                raise FileNotFoundError(f"Ensemble checkpoint not found: {p}")
+        if args.checkpoint is not None:
+            raise ValueError("--ensemble-checkpoints cannot be combined with --checkpoint.")
+        
+        model, ckpt_info = load_ensemble_models(ensemble_paths, cfg, device, strict=strict)
+        checkpoint_display = f"ensemble-{len(ensemble_paths)}x"
+    else:
+        checkpoint_path = _resolve_checkpoint(args, model_runs_root)
+        model, ckpt_info = load_model(checkpoint_path, cfg, device, strict=strict)
+        checkpoint_display = checkpoint_path.name
+    
     model.eval()
 
     dataset = Track1Dataset(
@@ -273,7 +307,7 @@ def export_predictions(args: argparse.Namespace) -> None:
     total_batches = len(loader)
     total_images = len(dataset)
     print(
-        f"[Export] Loaded checkpoint='{checkpoint_path.name}' "
+        f"[Export] Loaded checkpoint='{checkpoint_display}' "
         f"(variant={ckpt_info.get('loaded_variant', cfg.model_variant)}) "
         f"for split='{args.split}' | samples={total_images} | device={device}"
     )
