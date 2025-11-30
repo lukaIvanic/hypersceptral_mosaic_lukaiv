@@ -40,6 +40,24 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model-variant", type=str, default=None, help="Model variant override (e.g. unet_lite).")
     parser.add_argument("--hidden-channels", type=int, default=None, help="Hidden channel width for baseline variant.")
     parser.add_argument(
+        "--mst-internal-depth",
+        type=int,
+        default=None,
+        help="Number of encoder/decoder levels inside each MST body (default 1).",
+    )
+    parser.add_argument(
+        "--mst-num-blocks",
+        type=str,
+        default=None,
+        help="Comma-separated SAB block counts per MST level (length = mst-internal-depth + 1).",
+    )
+    parser.add_argument(
+        "--mst-ffn-mult",
+        type=int,
+        default=None,
+        help="Feed-forward expansion multiplier inside MST feed-forward layers (default 4).",
+    )
+    parser.add_argument(
         "--unet-base-channels",
         type=int,
         default=None,
@@ -236,6 +254,30 @@ def export_predictions(args: argparse.Namespace) -> None:
         cfg.use_raw_input_skip = True
     if args.conv_kernel_size is not None:
         cfg.conv_kernel_size = max(1, int(args.conv_kernel_size))
+    if getattr(args, "mst_internal_depth", None) is not None:
+        cfg.mst_internal_depth = max(1, int(args.mst_internal_depth))
+    if getattr(args, "mst_ffn_mult", None) is not None:
+        cfg.mst_ffn_mult = max(1, int(args.mst_ffn_mult))
+    if getattr(args, "mst_num_blocks", None) is not None:
+        raw_blocks = [
+            int(part.strip())
+            for part in str(args.mst_num_blocks).split(",")
+            if part.strip()
+        ]
+        if not raw_blocks:
+            raise ValueError("--mst-num-blocks must contain at least one integer.")
+        cfg.mst_num_blocks = tuple(raw_blocks)
+
+    expected_blocks = cfg.mst_internal_depth + 1
+    if len(cfg.mst_num_blocks) != expected_blocks:
+        if getattr(args, "mst_num_blocks", None) is None:
+            cfg.mst_num_blocks = tuple([1] * cfg.mst_internal_depth + [1])
+        else:
+            raise ValueError(
+                f"--mst-num-blocks expects {expected_blocks} values (got {len(cfg.mst_num_blocks)})."
+            )
+    if any(block <= 0 for block in cfg.mst_num_blocks):
+        raise ValueError("--mst-num-blocks values must be positive integers.")
     if args.device is not None:
         cfg.device = args.device
     if args.cache_dir is not None:

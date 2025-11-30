@@ -29,6 +29,9 @@ def create_model(
     conv_kernel_size: int,
     norm_type: str,
     use_raw_input_skip: bool = False,
+    mst_internal_depth: int = 1,
+    mst_num_blocks: tuple[int, ...] = (1, 1),
+    mst_ffn_mult: int = 4,
 ) -> nn.Module:
     variant_norm = variant.lower()
     if variant_norm == "baseline":
@@ -74,6 +77,9 @@ def create_model(
             stage=mst_stage,
             dropout=decoder_dropout,  # Reuse decoder_dropout for MST++ regularization
             use_raw_input_skip=use_raw_input_skip,
+            mst_unet_depth=mst_internal_depth,
+            num_blocks=list(mst_num_blocks),
+            ffn_mult=mst_ffn_mult,
         )
     raise ValueError(f"Unknown model variant '{variant}'. Supported: baseline, unet_lite, mst_plus_plus.")
 

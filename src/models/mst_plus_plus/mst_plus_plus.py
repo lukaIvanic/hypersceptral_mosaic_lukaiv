@@ -217,7 +217,8 @@ class MSAB(nn.Module):
             heads,
             num_blocks,
             use_checkpoint=False,
-            dropout=0.0
+            dropout=0.0,
+            ffn_mult=4
     ):
         super().__init__()
         self.blocks = nn.ModuleList([])
@@ -228,7 +229,7 @@ class MSAB(nn.Module):
                 # Spectral-wise Multi-head Self-Attention
                 MS_MSA(dim=dim, dim_head=dim_head, heads=heads),
                 # Pre-norm + Feed-Forward Network (with dropout)
-                PreNorm(dim, FeedForward(dim=dim, dropout=dropout))
+                PreNorm(dim, FeedForward(dim=dim, mult=ffn_mult, dropout=dropout))
             ]))
 
     def forward(self, x):
@@ -346,11 +347,22 @@ class MST(nn.Module):
         in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1]
         → ~50K parameters, processes 1024×1024 in seconds
     """
-    def __init__(self, in_dim=8, out_dim=8, dim=8, stage=1, num_blocks=[1, 1], use_checkpoint=False, dropout=0.0):
+    def __init__(
+        self,
+        in_dim=8,
+        out_dim=8,
+        dim=8,
+        stage=1,
+        num_blocks=[1, 1],
+        use_checkpoint=False,
+        dropout=0.0,
+        ffn_mult=4,
+    ):
         super(MST, self).__init__()
         self.dim = dim
         self.stage = stage
         self.dropout = dropout
+        self.ffn_mult = ffn_mult
 
         # Input projection: project input channels to internal feature dimension
         self.embedding = nn.Conv2d(in_dim, self.dim, 3, 1, 1, bias=False)
@@ -364,7 +376,7 @@ class MST(nn.Module):
                 # MSAB: Spectral attention blocks
                 # heads = dim_stage // dim → more heads at higher channels
                 MSAB(dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, 
-                     heads=dim_stage // dim, use_checkpoint=use_checkpoint, dropout=dropout),
+                     heads=dim_stage // dim, use_checkpoint=use_checkpoint, dropout=dropout, ffn_mult=ffn_mult),
                 # Downsample: 4×4 conv with stride 2 (halves spatial, doubles channels)
                 nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
             ]))
@@ -374,7 +386,7 @@ class MST(nn.Module):
         # Has the most channels (dim × 2^stage)
         self.bottleneck = MSAB(
             dim=dim_stage, dim_head=dim, heads=dim_stage // dim, 
-            num_blocks=num_blocks[-1], use_checkpoint=use_checkpoint, dropout=dropout)
+            num_blocks=num_blocks[-1], use_checkpoint=use_checkpoint, dropout=dropout, ffn_mult=ffn_mult)
 
         # DECODER: progressively upsample and decrease channels
         # Uses skip connections from encoder for detail preservation
@@ -390,7 +402,7 @@ class MST(nn.Module):
                 nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=False),
                 # MSAB for feature refinement at this resolution
                 MSAB(dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], 
-                     dim_head=dim, heads=(dim_stage // 2) // dim, use_checkpoint=use_checkpoint, dropout=dropout),
+                     dim_head=dim, heads=(dim_stage // 2) // dim, use_checkpoint=use_checkpoint, dropout=dropout, ffn_mult=ffn_mult),
             ]))
             dim_stage //= 2  # Halve channels at each decoder stage
 
@@ -518,6 +530,9 @@ class MST_Plus_Plus(nn.Module):
         use_checkpoint (bool): Enable gradient checkpointing for memory efficiency
         dropout (float): Dropout probability in attention/FFN (default: 0.0)
         use_raw_input_skip (bool): Add skip connection from raw input to output (default: False)
+        mst_unet_depth (int): Number of encoder/decoder levels inside each SST (default: 1)
+        num_blocks (Sequence[int] | None): SAB blocks per level (len = mst_unet_depth + 1). Defaults to all ones.
+        ffn_mult (int): Feed-forward expansion multiplier inside SAB (default: 4)
             This preserves high-frequency spatial detail from the raw mosaic that may be
             lost during transformer processing. The contribution is gated by a learnable
             scalar initialized to 0, so it has no effect until trained.
@@ -527,14 +542,42 @@ class MST_Plus_Plus(nn.Module):
         → ~15K parameters total, very fast inference
     
     Production Config (for quality):
-        in_channels=3, out_channels=61, n_feat=31, stage=3, dropout=0.1
-        → ~1M+ parameters, better reconstruction quality
+        in_channels=3, out_channels=61, n_feat=31, stage=3, dropout=0.1,
+        mst_unet_depth=2, num_blocks=[2, 2, 2], ffn_mult=4
+        → ~3M parameters, strong reconstruction quality
     """
-    def __init__(self, in_channels=3, out_channels=61, n_feat=8, stage=1, use_checkpoint=False, dropout=0.0, use_raw_input_skip=False):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=61,
+        n_feat=8,
+        stage=1,
+        use_checkpoint=False,
+        dropout=0.0,
+        use_raw_input_skip=False,
+        mst_unet_depth=1,
+        num_blocks=None,
+        ffn_mult=4,
+    ):
         super(MST_Plus_Plus, self).__init__()
         self.stage = stage
         self.dropout = dropout
         self.use_raw_input_skip = use_raw_input_skip
+        self.mst_unet_depth = max(1, mst_unet_depth)
+        self.ffn_mult = ffn_mult
+        
+        if num_blocks is None:
+            blocks = [1] * self.mst_unet_depth + [1]
+        else:
+            blocks = [int(b) for b in num_blocks]
+        expected_blocks = self.mst_unet_depth + 1
+        if len(blocks) != expected_blocks:
+            raise ValueError(
+                f"MST_Plus_Plus: num_blocks length ({len(blocks)}) must equal mst_unet_depth + 1 ({expected_blocks})."
+            )
+        if any(b <= 0 for b in blocks):
+            raise ValueError("MST_Plus_Plus: num_blocks values must be positive integers.")
+        self.num_blocks = blocks
         
         # Input projection: RGB (3 channels) → n_feat feature channels
         # Uses 3×3 conv for local spatial context aggregation
@@ -548,12 +591,20 @@ class MST_Plus_Plus(nn.Module):
         # MST parameters:
         #   - dim=n_feat: Base channel dimension for attention heads
         #   - in_dim/out_dim=n_feat: Input/output channels (internal feature space)
-        #   - stage=1: Number of encoder/decoder levels in U-Net structure (minimal)
-        #   - num_blocks=[1, 1]: Number of SABs at each resolution level (minimal)
+        #   - stage=mst_unet_depth: Number of encoder/decoder levels in U-Net structure
+        #   - num_blocks: SAB count per resolution level (length = stage + 1)
         #   - dropout: Regularization in attention and FFN
         modules_body = [
-            MST(dim=n_feat, in_dim=n_feat, out_dim=n_feat, stage=1, 
-                num_blocks=[1, 1], use_checkpoint=use_checkpoint, dropout=dropout) 
+            MST(
+                dim=n_feat,
+                in_dim=n_feat,
+                out_dim=n_feat,
+                stage=self.mst_unet_depth,
+                num_blocks=self.num_blocks,
+                use_checkpoint=use_checkpoint,
+                dropout=dropout,
+                ffn_mult=self.ffn_mult,
+            )
             for _ in range(stage)
         ]
         self.body = nn.Sequential(*modules_body)

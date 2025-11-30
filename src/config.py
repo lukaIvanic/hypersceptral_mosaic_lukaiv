@@ -87,6 +87,11 @@ class TrainConfig:
     latent_channels: int = 32
     encoder_depth: int = 3
 
+    # MST++ (transformer) specific hyperparameters
+    mst_internal_depth: int = 1  # Number of encoder/decoder levels inside each MST body
+    mst_num_blocks: tuple[int, ...] = (1, 1)  # SAB blocks per level (len = mst_internal_depth + 1)
+    mst_ffn_mult: int = 4  # Feed-forward expansion multiplier inside SAB
+
     # LR scheduler
     lr_scheduler: str = "none"  # options: none, cosine
     scheduler_warmup_epochs: int = 0

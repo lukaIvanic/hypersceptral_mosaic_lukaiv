@@ -397,6 +397,9 @@ def load_model(
         conv_kernel_size=cfg.conv_kernel_size,
         norm_type=cfg.norm_type,
         use_raw_input_skip=cfg.use_raw_input_skip,
+        mst_internal_depth=cfg.mst_internal_depth,
+        mst_num_blocks=cfg.mst_num_blocks,
+        mst_ffn_mult=cfg.mst_ffn_mult,
     ).to(device)
     model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -591,6 +594,30 @@ def main(args: argparse.Namespace) -> None:
         cfg.use_bottleneck_attention = True
     if getattr(args, "use_raw_input_skip", False):
         cfg.use_raw_input_skip = True
+    if getattr(args, "mst_internal_depth", None) is not None:
+        cfg.mst_internal_depth = max(1, int(args.mst_internal_depth))
+    if getattr(args, "mst_ffn_mult", None) is not None:
+        cfg.mst_ffn_mult = max(1, int(args.mst_ffn_mult))
+    if getattr(args, "mst_num_blocks", None) is not None:
+        raw_blocks = [
+            int(part.strip())
+            for part in str(args.mst_num_blocks).split(",")
+            if part.strip()
+        ]
+        if not raw_blocks:
+            raise ValueError("--mst-num-blocks must contain at least one integer.")
+        cfg.mst_num_blocks = tuple(raw_blocks)
+
+    expected_blocks = cfg.mst_internal_depth + 1
+    if len(cfg.mst_num_blocks) != expected_blocks:
+        if getattr(args, "mst_num_blocks", None) is None:
+            cfg.mst_num_blocks = tuple([1] * cfg.mst_internal_depth + [1])
+        else:
+            raise ValueError(
+                f"--mst-num-blocks expects {expected_blocks} values (got {len(cfg.mst_num_blocks)})."
+            )
+    if any(block <= 0 for block in cfg.mst_num_blocks):
+        raise ValueError("--mst-num-blocks values must be positive integers.")
 
     device = torch.device(cfg.device)
 
@@ -1022,6 +1049,24 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--hidden-channels", type=int, default=None)
+    parser.add_argument(
+        "--mst-internal-depth",
+        type=int,
+        default=None,
+        help="Number of encoder/decoder levels inside each MST body (default 1).",
+    )
+    parser.add_argument(
+        "--mst-num-blocks",
+        type=str,
+        default=None,
+        help="Comma-separated SAB block counts per MST level (length = mst-internal-depth + 1).",
+    )
+    parser.add_argument(
+        "--mst-ffn-mult",
+        type=int,
+        default=None,
+        help="Feed-forward expansion multiplier inside MST feed-forward layers (default 4).",
+    )
     parser.add_argument(
         "--lambda-ergas",
         type=float,
