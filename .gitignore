@@ -7,3 +7,6 @@ datasets/hyper_object_all.py
 draft.ipynb
 
 runs/*
+src/models/*/runs/*
+
+/*__pycache__*
